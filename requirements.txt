@@ -1,0 +1,8 @@
+streamlit
+google-genai
+pandas
+matplotlib
+numpy
+datasets
+tqdm
+razorpay

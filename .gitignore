@@ -1,0 +1,28 @@
+--- CoreAI Git Tracking Configuration ---
+Ignore the heavy raw database (Wont be uploaded to GitHub)
+coreai_vault.db
+coreai_vault.db-journal
+Keep the compressed database! (This WILL be uploaded to GitHub)
+!coreai_vault.zip
+Ignore local run progress files and logs
+ingest_progress.json
+*.log
+build_log.txt
+check_db.log
+Ignore local Python runtime caching
+pycache/
+*.py[cod]
+*$py.class
+venv/
+.env
+Ignore environment/IDE configurations
+.vscode/
+.DS_Store
+This will generate a highly compressed ⁠coreai_vault.zip⁠ file in your folder that easily fits within GitHub's limits!
+Step 2: Integrate the Unpacker into ⁠app.py⁠
+Open your ⁠app.py⁠ file in VS Code and import the helper at the very top of your script (above your database connections):
+Save your ⁠app.py⁠ file (⁠Ctrl + S⁠).
+Step 3: Push Your Clean App to GitHub
+Open your terminal and run the git push sequence:
+(Because of our custom ⁠.gitignore⁠, Git will ignore the large ⁠coreai_vault.db⁠ file and safely track ⁠coreai_vault.zip⁠ instead!)
+Link your online GitHub repository and push your code:
