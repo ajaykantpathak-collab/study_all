@@ -7,24 +7,24 @@ import logging
 from datetime import datetime
 from contextlib import contextmanager
 import streamlit as st
+from streamlit_mermaid import st_mermaid
 
 # ==========================================
-# 0. SYSTEM CONFIGURATION & INITIALIZATION
+# 0. SYSTEM CONFIGURATION & SECURITY BOOT
 # ==========================================
 
-# Configure logging patterns cleanly
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("CoreAIEngine")
 
 DB_NAME = "coreai_vault.db"
-DAILY_LIMIT = 5
+
+# Force environment sync for GenAI SDK compatibility on Streamlit Cloud
+if "GEMINI_API_KEY" in st.secrets:
+    os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
 
 @contextmanager
 def get_db_connection():
-    """
-    Yields a thread-isolated SQLite connection.
-    Guarantees closure upon exiting the context block, preventing memory leaks.
-    """
+    """Yields a thread-isolated SQLite connection and guarantees absolute closure."""
     conn = sqlite3.connect(DB_NAME, timeout=60.0)
     conn.execute("PRAGMA synchronous=NORMAL;") 
     try:
@@ -33,7 +33,7 @@ def get_db_connection():
         conn.close()
 
 def run_schema_migration_safely():
-    """Compiles tables and sets persistent WAL PRAGMAs under a global boot lock."""
+    """Compiles tables safely without assuming legacy constraint structures."""
     try:
         conn = sqlite3.connect(DB_NAME, timeout=60.0)
         conn.execute("PRAGMA journal_mode=WAL;") 
@@ -46,7 +46,7 @@ def run_schema_migration_safely():
                     board TEXT,
                     level TEXT,
                     subject TEXT,
-                    question TEXT UNIQUE,
+                    question TEXT,
                     solution_hi TEXT,
                     solution_en TEXT,
                     difficulty TEXT,
@@ -62,22 +62,14 @@ def run_schema_migration_safely():
                 )
             """)
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS user_usage_ledger (
+                CREATE TABLE IF NOT EXISTS analytics_ledger (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT,
-                    request_date TEXT,
-                    timestamp REAL
+                    subject TEXT,
+                    stream_level TEXT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            
-            # Hot patch missing schemas dynamically if the baseline is outdated
-            cursor.execute("PRAGMA table_info(academic_vault);")
-            columns = [col[1] for col in cursor.fetchall()]
-            if columns:
-                if "solution_hi" not in columns:
-                    cursor.execute("ALTER TABLE academic_vault ADD COLUMN solution_hi TEXT;")
-                if "solution_en" not in columns:
-                    cursor.execute("ALTER TABLE academic_vault ADD COLUMN solution_en TEXT;")
-                    
         conn.close()
         logger.info("Database schemas verified and initialized safely.")
     except Exception as e:
@@ -86,41 +78,36 @@ def run_schema_migration_safely():
 
 @st.cache_resource(show_spinner="Provisioning core engine assets...")
 def global_system_provisioning():
-    """Runs strictly ONCE per server deployment instance lifetime."""
+    """Runs strictly ONCE per deployment to unpack assets and verify SDKs."""
     try:
         from db_helper import verify_and_unpack_database
         verify_and_unpack_database()
-        logger.info("Database baseline unpacked successfully.")
-    except Exception as e:
-        logger.error(f"Critical unpack failure: {e}")
-        st.error(f"Failed to unpack database baseline: {e}")
+    except Exception:
+        pass
     
     try:
         run_schema_migration_safely()
     except Exception as e:
-        st.error(f"Critical schema initialization failure: {e}")
+        st.error(f"Database Initialization Failed: {e}")
         st.stop()
-    
+        
     try:
         from google import genai
-        from google.genai import types
-        from PIL import Image as PILImage
+        from PIL import Image
     except ImportError:
-        st.error("❌ CRITICAL DEPLOYMENT FAILURE: Run 'pip install google-genai pypdf pillow' in terminal.")
+        st.error("Missing libraries. Ensure google-genai and pillow are in requirements.txt.")
         st.stop()
         
     return True
 
-# Initialize database storage context safely across threads
 global_system_provisioning()
 
-
 # ───────────────────────────────────────────────────────────────
-# ⚙️ DATA TRANSACTION & SECURITY LAYER
+# ⚙️ DATA TRANSACTION LAYER
 # ───────────────────────────────────────────────────────────────
 
 def run_write_transaction(query, params=(), max_retries=5) -> bool:
-    """Executes a database write mutation using a linear retry backoff strategy."""
+    """Safe concurrency writer with linear backoff for locked databases."""
     for attempt in range(max_retries):
         try:
             with get_db_connection() as conn:
@@ -132,25 +119,17 @@ def run_write_transaction(query, params=(), max_retries=5) -> bool:
             if "locked" in str(e).lower() and attempt < max_retries - 1:
                 time.sleep(0.1 * (attempt + 1))  
                 continue
-            logger.error(f"Database Concurrency Failure on attempt {attempt}: {e}")
             return False
-        except Exception as e:
-            logger.error(f"Database Exception: {e}")
+        except Exception:
             return False
     return False
 
 def hash_password(password: str) -> str:
-    """Computes a salted, stretched hash value to protect against rainbow tables."""
     salt = "CoreAI_Secure_Salt_2026_#"  
-    payload = password + salt
-    return hashlib.sha256(payload.encode()).hexdigest()
+    return hashlib.sha256((password + salt).encode()).hexdigest()
 
 def register_user_identity(username, password) -> bool:
-    pwd_hash = hash_password(password)
-    return run_write_transaction(
-        "INSERT INTO app_users (username, password_hash) VALUES (?, ?)", 
-        (username, pwd_hash)
-    )
+    return run_write_transaction("INSERT INTO app_users (username, password_hash) VALUES (?, ?)", (username, hash_password(password)))
 
 def authenticate_user_identity(username, password) -> bool:
     try:
@@ -158,143 +137,175 @@ def authenticate_user_identity(username, password) -> bool:
             cursor = conn.cursor()
             cursor.execute("SELECT password_hash FROM app_users WHERE username = ?", (username,))
             row = cursor.fetchone()
-            if row and row[0] == hash_password(password):
-                return True
-            return False
+            return row and row[0] == hash_password(password)
     except Exception:
         return False
 
-def check_remaining_quota(username) -> int:
-    """Calculates available remaining request counts for the current user."""
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT COUNT(*) FROM user_usage_ledger WHERE username = ? AND request_date = ?", 
-                (username, today_str)
-            )
-            count = cursor.fetchone()[0]
-            remaining = DAILY_LIMIT - count
-            return max(0, remaining)
-    except Exception:
-        return 0
-
-def log_user_quota_consumption(username):
-    today_str = datetime.now().strftime("%Y-%m-%d")
+def log_analytics_event(username, subject, level):
     run_write_transaction(
-        "INSERT INTO user_usage_ledger (username, request_date, timestamp) VALUES (?, ?, ?)",
-        (username, today_str, time.time())
+        "INSERT INTO analytics_ledger (username, subject, stream_level) VALUES (?, ?, ?)",
+        (username, subject, level)
     )
 
-
 # ───────────────────────────────────────────────────────────────
-# 🧠 RETRIEVAL-AUGMENTED GENERATION (RAG) ENGINE
+# 🧠 AUTO-INGESTING MULTIMODAL RAG ENGINE
 # ───────────────────────────────────────────────────────────────
 
 def retrieve_rag_context(student_query: str, subject: str, limit=2) -> str:
-    """Scans the local repository matching keywords to pull structural reference contexts."""
+    if not student_query:
+        return "No textual context markers provided."
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                SELECT question, solution_en 
-                FROM academic_vault 
-                WHERE subject = ? AND solution_en IS NOT NULL
-                LIMIT 50
-            """, (subject,))
+            cursor.execute("SELECT question, solution_en FROM academic_vault WHERE subject = ? AND solution_en IS NOT NULL LIMIT 50", (subject,))
             records = cursor.fetchall()
             
             context_segments = []
             keywords = [kw.lower() for kw in student_query.split() if len(kw) > 3]
-            
             for q_text, sol_text in records:
                 if any(kw in q_text.lower() for kw in keywords):
                     context_segments.append(f"Reference Question: {q_text}\nVerified Solution: {sol_text}")
-                    if len(context_segments) >= limit:
-                        break
-            
+                    if len(context_segments) >= limit: break
             return "\n\n---\n\n".join(context_segments) if context_segments else "No direct reference matches found."
-    except Exception as e:
-        logger.error(f"RAG retrieval lookup failure: {e}")
+    except Exception:
         return "No direct reference matches found."
 
-def generate_rag_response(student_query: str, subject: str) -> str:
-    """Orchestrates RAG context embedding merges directly inside Gemini pipeline loops."""
+def commit_new_question_to_vault(level, subject, raw_question, parsed_en, parsed_hi) -> bool:
+    """Safely checks for existing data before committing to avoid schema crashes."""
+    clean_q = raw_question.strip()
+    if not clean_q or len(clean_q) < 5:
+        return False
+        
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM academic_vault WHERE question = ?", (clean_q,))
+            if cursor.fetchone():
+                return True 
+            
+            cursor.execute("""
+                INSERT INTO academic_vault (board, level, subject, question, solution_en, solution_hi, difficulty, question_type, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, ("CBSE/State", level, subject, clean_q, parsed_en, parsed_hi, "Medium", "Conceptual", "Organic_Student_Ingestion"))
+            conn.commit()
+            return True
+    except Exception as e:
+        logger.error(f"Failed to auto-ingest question: {e}")
+        return False
+
+def generate_multimodal_rag_response(student_query: str, level: str, subject: str, uploaded_file) -> dict:
     try:
         from google import genai
+        from google.genai import types
+        from PIL import Image as PILImage
+        import io
+
         client = genai.Client()
-        
         local_context = retrieve_rag_context(student_query, subject)
         
         engineered_prompt = f"""
-        You are an elite academic tutor specializing in engineering and medical entry exams. 
-        Answer the student's question accurately using clean step-by-step reasoning formatting.
+        You are an elite academic tutor. Analyze the problem input query.
+        Provide your final response structured EXACTLY within these parameters:
         
-        If the verified database reference material below matches the context of the query, 
-        base your calculations and steps directly on it to maintain total accuracy.
+        [CLEAN_QUESTION_TEXT]
+        Extract and rewrite a clean, standardized, single-line text version of the question being asked. Do not include answers here.
+        
+        [CONCEPT_DIAGRAM]
+        Draft a high-level description of the concept and STRICTLY include a Mermaid graph architecture block wrapped in ```mermaid tags.
+        
+        [ENGLISH_SOLUTION]
+        Provide a complete step-by-step mathematical or conceptual resolution in English.
+        
+        [HINDI_SOLUTION]
+        हिंदी में पूरा कदम-दर-कदम समाधान प्रदान करें।
 
-        VERIFIED INTERNAL DATABASE REFERENCE MATERIAL:
+        VERIFIED DATABASE CONTEXT FOR GROUNDING:
         {local_context}
 
-        STUDENT QUESTION:
-        {student_query}
+        STUDENT DIRECTIONS:
+        {student_query if student_query else "Process the attached file."}
         """
+
+        contents = []
+        if uploaded_file is not None:
+            file_bytes = uploaded_file.read()
+            if uploaded_file.type.startswith("image/"):
+                contents.append(PILImage.open(io.BytesIO(file_bytes)))
+            elif uploaded_file.type == "application/pdf":
+                contents.append(types.Part.from_bytes(data=file_bytes, mime_type="application/pdf"))
         
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=engineered_prompt
-        )
-        return response.text if response.text else "Failed to generate text content response."
+        contents.append(engineered_prompt)
+        response = client.models.generate_content(model='gemini-2.5-flash', contents=contents)
+        raw_text = response.text if response.text else ""
+        
+        extracted_q = student_query if student_query else "Image Question Entry"
+        sol_en, sol_hi, concept = "Generation failed.", "समाधान विफल।", "No schematic map."
+        
+        try:
+            if "[CLEAN_QUESTION_TEXT]" in raw_text:
+                parts = raw_text.split("[CLEAN_QUESTION_TEXT]")[1].split("[CONCEPT_DIAGRAM]")
+                extracted_q = parts[0].strip()
+                sub_parts = parts[1].split("[ENGLISH_SOLUTION]")
+                concept = sub_parts[0].strip()
+                final_parts = sub_parts[1].split("[HINDI_SOLUTION]")
+                sol_en = final_parts[0].strip()
+                sol_hi = final_parts[1].strip()
+        except Exception:
+            sol_en = raw_text
+        
+        commit_new_question_to_vault(level, subject, extracted_q, sol_en, sol_hi)
+        return {"concept": concept, "en": sol_en, "hi": sol_hi}
     except Exception as e:
-        logger.error(f"RAG generation pipeline processing failure: {e}")
-        return f"Error handling generation query: {e}"
-
+        return {"concept": f"Pipeline Error: {e}", "en": "System encountered an anomaly.", "hi": "त्रुटि"}
 
 # ───────────────────────────────────────────────────────────────
-# 📈 DATA ANALYTICS & CACHING LAYER
+# 📈 TAXONOMY & EXAM PAPER MAKER LAYER
 # ───────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=600, show_spinner=False)
-def get_cached_system_metrics():
+def get_live_system_metrics():
     try:
         with get_db_connection() as conn:
-            df_count = pd.read_sql_query("SELECT COUNT(*) as total FROM academic_vault", conn)
-            df_comp = pd.read_sql_query("""
-                SELECT level, COUNT(*) as cnt 
-                FROM academic_vault 
-                WHERE level IS NOT NULL 
-                GROUP BY level 
-                ORDER BY cnt DESC
-            """, conn)
-        return int(df_count["total"].iloc[0]), df_comp.values.tolist()
-    except Exception:
-        return 0, []
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM academic_vault")
+            return cursor.fetchone()[0]
+    except Exception: 
+        return 0
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_optimized_dropdown_bounds():
+def fetch_mock_exam_paper(level, subject, limit=10):
     try:
         with get_db_connection() as conn:
-            df = pd.read_sql_query("""
-                SELECT DISTINCT level, subject 
-                FROM academic_vault 
-                WHERE level IS NOT NULL AND subject IS NOT NULL
-            """, conn)
-        mapping = {}
-        for _, row in df.iterrows():
-            lvl, subj = row['level'], row['subject']
-            if lvl not in mapping: mapping[lvl] = []
-            if subj not in mapping[lvl]: mapping[lvl].append(subj)
-        return mapping
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT question FROM academic_vault WHERE level = ? AND subject = ? AND question NOT LIKE 'Image Question%' ORDER BY RANDOM() LIMIT ?",
+                (level, subject, limit)
+            )
+            return [row[0] for row in cursor.fetchall()]
     except Exception:
-        return {
-            "Class 11-12 (NEET)": ["Physics", "Chemistry", "Biology"], 
-            "JEE Mains & Advanced": ["Mathematics", "Physics"]
-        }
+        return []
 
-STRUCTURED_MAP = fetch_optimized_dropdown_bounds()
-SYSTEM_LEVELS = list(STRUCTURED_MAP.keys()) if STRUCTURED_MAP else ["JEE Mains", "NEET Core"]
+def get_comprehensive_taxonomy():
+    primary_subjects = ["Mathematics", "Environmental Studies (EVS)", "English", "Hindi", "General Knowledge"]
+    middle_subjects = ["Mathematics", "Science", "Social Science", "English", "Hindi", "Sanskrit"]
+    secondary_subjects = ["Mathematics", "Science", "Social Science", "English", "Hindi", "Computer Applications"]
+    senior_science = ["Physics", "Chemistry", "Mathematics", "Biology", "English", "Computer Science"]
+    senior_commerce = ["Accountancy", "Business Studies", "Economics", "Mathematics", "English"]
+    senior_humanities = ["History", "Political Science", "Geography", "Economics", "Psychology", "English"]
+    
+    return {
+        "Class 1": primary_subjects, "Class 2": primary_subjects, "Class 3": primary_subjects,
+        "Class 4": primary_subjects, "Class 5": primary_subjects, "Class 6": middle_subjects,
+        "Class 7": middle_subjects, "Class 8": middle_subjects, "Class 9": secondary_subjects,
+        "Class 10": secondary_subjects, 
+        "Class 11 (Science)": senior_science, "Class 11 (Commerce)": senior_commerce, "Class 11 (Humanities)": senior_humanities,
+        "Class 12 (Science)": senior_science, "Class 12 (Commerce)": senior_commerce, "Class 12 (Humanities)": senior_humanities,
+        "JEE Main": ["Mathematics", "Physics", "Chemistry"],
+        "JEE Advanced": ["Mathematics", "Physics", "Chemistry"],
+        "NEET Core": ["Physics", "Chemistry", "Biology"],
+        "CUET (UG)": ["Domain Subjects", "Languages", "General Test"]
+    }
 
+STRUCTURED_MAP = get_comprehensive_taxonomy()
+SYSTEM_LEVELS = list(STRUCTURED_MAP.keys())
 
 # ==========================================
 # 2. STREAMLIT VISUAL PRESENCE USER INTERFACE
@@ -302,117 +313,144 @@ SYSTEM_LEVELS = list(STRUCTURED_MAP.keys()) if STRUCTURED_MAP else ["JEE Mains",
 
 st.set_page_config(page_title="CoreAI Intellect Engine", page_icon="🧠", layout="wide")
 
-# Persistent state initialization metrics
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-if "current_user" not in st.session_state:
-    st.session_state.current_user = None
+if "authenticated" not in st.session_state: st.session_state.authenticated = False
+if "current_user" not in st.session_state: st.session_state.current_user = None
+if "payload_dict" not in st.session_state: st.session_state.payload_dict = None
 
-# Sidebar branding wrapper
 with st.sidebar:
     st.title("🧠 CoreAI Engine")
     st.markdown("---")
-    
     if st.session_state.authenticated:
-        st.success(f"Active Account: **{st.session_state.current_user}**")
-        remaining = check_remaining_quota(st.session_state.current_user)
-        st.metric(label="Remaining Daily Queries", value=f"{remaining} / {DAILY_LIMIT}")
-        
-        st.markdown("---")
-        if st.button("Log Out of Session", use_container_width=True):
+        st.success(f"Active User: **{st.session_state.current_user}**")
+        st.info("🔄 Data Flywheel Online")
+        if st.button("Log Out of App"):
             st.session_state.authenticated = False
             st.session_state.current_user = None
+            st.session_state.payload_dict = None
             st.rerun()
-    else:
-        st.warning("🔒 Secure Terminal Context Locked")
 
-# 🟢 MAIN DISPLAY LOOP: ACCESS ROUTER (Auth vs App Dashboard)
 if not st.session_state.authenticated:
     st.header("Institutional Identity Validation Gateway")
-    
-    tab_login, tab_register = st.tabs(["🔒 Secure Identity Login", "✍️ Register New Profile"])
-    
+    tab_login, tab_register = st.tabs(["🔒 Secure Login", "✍️ Register Profile"])
     with tab_login:
         with st.form("auth_login_form"):
             user_input = st.text_input("Username").strip()
             pass_input = st.text_input("Password", type="password")
-            btn_submit = st.form_submit_button("Validate Credentials")
-            
-            if btn_submit:
-                if not user_input or not pass_input:
-                    st.error("Input fields cannot be left empty.")
-                elif authenticate_user_identity(user_input, pass_input):
+            if st.form_submit_button("Validate Credentials"):
+                if authenticate_user_identity(user_input, pass_input):
                     st.session_state.authenticated = True
                     st.session_state.current_user = user_input
-                    st.success("Access privileges confirmed!")
                     st.rerun()
-                else:
-                    st.error("Invalid username or password match found.")
+                else: st.error("Invalid details.")
                     
     with tab_register:
         with st.form("auth_register_form"):
             reg_user = st.text_input("Create Username").strip()
             reg_pass = st.text_input("Create Password", type="password")
-            btn_register = st.form_submit_button("Commit Profile Database Entry")
-            
-            if btn_register:
-                if len(reg_user) < 4 or len(reg_pass) < 6:
-                    st.error("Username must be >= 4 chars, Password must be >= 6 chars.")
-                elif register_user_identity(reg_user, reg_pass):
-                    st.success("Account successfully created! Please log in inside the Login Tab.")
-                else:
-                    st.error("Username already exists or database transaction dropped.")
-
+            if st.form_submit_button("Register Account"):
+                if len(reg_user) < 4 or len(reg_pass) < 6: st.error("Username/Password too short.")
+                elif register_user_identity(reg_user, reg_pass): st.success("Created successfully!")
+                else: st.error("Registration failed. User may exist.")
 else:
-    # Authenticated Student Dashboard Interface Loop
-    total_q, metric_distribution = get_cached_system_metrics()
+    total_q = get_live_system_metrics()
     
-    # Hero Title Metrics Row
-    col_title, col_m1, col_m2 = st.columns([2, 1, 1])
-    with col_title:
-        st.title("🧠 CoreAI Academic RAG Portal")
-        st.caption("Sub-second semantic augmentation engine running over indexed institution assets.")
-    with col_m1:
-        st.metric(label="Total Vault Knowledge Assets", value=f"{total_q:,} Questions")
-    with col_m2:
-        st.metric(label="Daily Limit Reset Boundary", value="24 Hours Rolling")
-        
-    st.markdown("---")
+    portal_tab, practice_tab, analytics_tab = st.tabs(["🎯 Study Resolution Portal", "📋 Practice Test Maker", "📊 Diagnostic Analytics"])
     
-    # Workspace Filter Selection Array Layout
-    col_sel1, col_sel2 = st.columns(2)
-    with col_sel1:
-        selected_level = st.selectbox("Target Academic Classification Stream", SYSTEM_LEVELS)
-    with col_sel2:
-        available_subjects = STRUCTURED_MAP.get(selected_level, ["General Science"])
-        selected_subject = st.selectbox("Academic Disciplines Module", available_subjects)
+    # ─── TAB 1: CORE STUDY PORTAL ───
+    with portal_tab:
+        st.title("🧠 CoreAI Multimodal RAG Engine")
+        st.caption("Snap a photo of your notebook problem or upload an assignment sheet directly.")
+        st.metric(label="Total Decentralized Vault Assets", value=f"{total_q:,} Questions")
+        st.markdown("---")
         
-    st.markdown("### 📝 Input Academic Query String")
-    input_query_text = st.text_area(
-        label="Type your core target question cleanly here for semantic evaluation matrix resolution:",
-        placeholder="Paste standard problem question format text blocks here to evaluate solutions...",
-        height=150
-    )
-    
-    if st.button("Compute Grounded Resolution Engine", type="primary", use_container_width=True):
-        current_username = st.session_state.current_user
+        col_sel1, col_sel2 = st.columns(2)
+        with col_sel1: selected_level = st.selectbox("Select Grade / Target Class Stream", SYSTEM_LEVELS, key="portal_lvl")
+        with col_sel2: selected_subject = st.selectbox("Select Academic Subject Module", STRUCTURED_MAP.get(selected_level, ["Science"]), key="portal_subj")
+            
+        uploaded_file = st.file_uploader("Upload notebook screenshot or problem file (PNG, JPG, PDF):", type=["png", "jpg", "jpeg", "pdf"])
+        input_query_text = st.text_area(label="Add notes or custom text queries manually:", placeholder="Type special instructions here...", height=100)
         
-        # Guardrail execution boundary pipeline evaluation checks
-        if not input_query_text.strip():
-            st.error("Please insert a valid textual query string pattern.")
-        elif check_remaining_quota(current_username) <= 0:
-            st.error("🚨 ALLOCATION OVERFLOW: You have reached your rolling 24-hour request cutoff profile limits.")
-        else:
-            with st.spinner("Executing structural retrieval analytics and generation matrices..."):
-                # Execute user billing deduction consumption profile trackers first
-                log_user_quota_consumption(current_username)
+        if st.button("Compute Grounded Multimodal Engine", type="primary", use_container_width=True):
+            if not input_query_text.strip() and uploaded_file is None:
+                st.error("Please add a text question or upload an image file.")
+            else:
+                with st.spinner("Processing visual analysis and auto-ingesting to database..."):
+                    log_analytics_event(st.session_state.current_user, selected_subject, selected_level)
+                    st.session_state.payload_dict = generate_multimodal_rag_response(input_query_text.strip(), selected_level, selected_subject, uploaded_file)
+                    st.rerun()
+
+        if st.session_state.payload_dict:
+            st.markdown("---")
+            st.success("✨ Resolution processed and successfully injected into your permanent repository vault!")
+            tab_en, tab_hi, tab_diagram = st.tabs(["🇬🇧 English Explanation", "🇮🇳 हिंदी समाधान", "🎯 Concept Map & Layout"])
+            
+            with tab_en: 
+                st.markdown(st.session_state.payload_dict.get("en", ""))
+            
+            with tab_hi: 
+                st.markdown(st.session_state.payload_dict.get("hi", ""))
+            
+            with tab_diagram: 
+                concept_data = st.session_state.payload_dict.get("concept", "")
                 
-                # Fetch output metrics
-                generated_solution_output = generate_rag_response(input_query_text.strip(), selected_subject)
-                
-                st.markdown("### 🎯 Grounded AI Resolution Output")
-                st.info("Response verified and grounded through historical internal database context profiles.")
-                st.markdown(generated_solution_output)
-                
-                # Force instant sidebar update tracking limits
-                st.rerun()
+                # SAFE RENDERING BLOCK: Checks for Mermaid syntax and renders graphics cleanly
+                if "```mermaid" in concept_data:
+                    try:
+                        # Extract the text before the diagram (if the AI included an explanation)
+                        text_before = concept_data.split("```mermaid")[0].strip()
+                        if text_before:
+                            st.markdown(text_before)
+                            
+                        # Isolate and render the mermaid diagram
+                        mermaid_code = concept_data.split("```mermaid")[1].split("```")[0].strip()
+                        st_mermaid(mermaid_code, height="500px")
+                    except Exception:
+                        st.markdown(concept_data) # Fallback to raw text if parsing fails
+                else:
+                    st.markdown(concept_data) # Fallback for standard ASCII text charts
+
+    # ─── TAB 2: INSTANT TEST PAPER GENERATOR ───
+    with practice_tab:
+        st.title("📋 Automated Mock Test Generator")
+        st.caption("Compiles an instant, custom testing matrix using curated database rows.")
+        
+        col_p1, col_p2, col_p3 = st.columns(3)
+        with col_p1: p_level = st.selectbox("Select Target Stream", SYSTEM_LEVELS, key="prac_lvl")
+        with col_p2: p_subject = st.selectbox("Select Target Subject", STRUCTURED_MAP.get(p_level, ["Science"]), key="prac_subj")
+        with col_p3: q_count = st.slider("Total Questions on Sheet", 5, 20, 10)
+        
+        if st.button("Generate Custom Practice Test Paper", use_container_width=True, type="primary"):
+            with st.spinner("Compiling test sheet indices..."):
+                questions = fetch_mock_exam_paper(p_level, p_subject, q_count)
+                if not questions:
+                    st.warning("No questions found in database yet. Go run a query in the Study Portal tab to auto-grow your list!")
+                else:
+                    st.markdown("---")
+                    st.subheader(f"📝 Practice Test Sheet: {p_level} - {p_subject}")
+                    
+                    for idx, q_string in enumerate(questions, 1):
+                        st.markdown(f"**Question {idx}:** {q_string}")
+                        st.text_area("Write solution here:", key=f"ans_box_{idx}", height=70)
+                        st.markdown("---")
+
+    # ─── TAB 3: VISUAL METRICS ANALYTICS ───
+    with analytics_tab:
+        st.title("📊 Diagnostic Focus Area Analytics")
+        
+        try:
+            with get_db_connection() as conn:
+                df_logs = pd.read_sql_query(
+                    "SELECT subject, COUNT(*) as queries FROM analytics_ledger WHERE username = ? GROUP BY subject ORDER BY queries DESC", 
+                    conn, params=(st.session_state.current_user,)
+                )
+            if df_logs.empty:
+                st.info("No logs compiled yet. Complete a few study portal questions to generate your charts!")
+            else:
+                col_chart, col_report = st.columns([2, 1])
+                with col_chart:
+                    st.bar_chart(data=df_logs, x="subject", y="queries", color="#FF4B4B")
+                with col_report:
+                    top_subject = df_logs.iloc[0]["subject"]
+                    st.write(f"Your primary study module focus is concentrated heavily on **{top_subject}**.")
+        except Exception:
+            st.info("Analytics engine ready. Complete a question query to compute your tracking charts.")

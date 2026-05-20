@@ -10,3 +10,4 @@ pillow
 pypdf
 pdf2image
 pdfplumber
+streamlit-mermaid
