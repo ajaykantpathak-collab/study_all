@@ -336,7 +336,7 @@ if not st.session_state.authenticated:
         with st.form("auth_login_form"):
             user_input = st.text_input("Username").strip()
             pass_input = st.text_input("Password", type="password")
-            btn_submit = st.form_submit_with_button("Validate Credentials")
+            btn_submit = st.form_submit_button("Validate Credentials")
             
             if btn_submit:
                 if not user_input or not pass_input:
@@ -353,7 +353,7 @@ if not st.session_state.authenticated:
         with st.form("auth_register_form"):
             reg_user = st.text_input("Create Username").strip()
             reg_pass = st.text_input("Create Password", type="password")
-            btn_register = st.form_submit_with_button("Commit Profile Database Entry")
+            btn_register = st.form_submit_button("Commit Profile Database Entry")
             
             if btn_register:
                 if len(reg_user) < 4 or len(reg_pass) < 6:
