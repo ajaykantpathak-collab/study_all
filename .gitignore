@@ -26,3 +26,18 @@ Step 3: Push Your Clean App to GitHub
 Open your terminal and run the git push sequence:
 (Because of our custom ⁠.gitignore⁠, Git will ignore the large ⁠coreai_vault.db⁠ file and safely track ⁠coreai_vault.zip⁠ instead!)
 Link your online GitHub repository and push your code:
+
+# Ignore local Streamlit secrets and configurations
+.streamlit/
+secrets.toml
+
+# Ignore the large SQLite data file
+coreai_vault.db
+
+# Ignore Python cache files
+_pycache_/
+*.pyc
+
+# Ignore OS files
+.DS_Store
+Thumbs.db

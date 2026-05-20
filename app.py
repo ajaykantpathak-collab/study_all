@@ -1,102 +1,149 @@
-# ==========================================
-# 1. AUTOMATIC CLOUD DATABASE UNPACKER
-# ==========================================
 import os
-from db_helper import verify_and_unpack_database
-verify_and_unpack_database()
-# ==========================================
-
-import streamlit as st
 import sqlite3
 import pandas as pd
 import time
 import hashlib
 import logging
 from datetime import datetime
-from io import BytesIO
+from contextlib import contextmanager
+import streamlit as st
 
-# Try-except safety harness for critical enterprise visual libraries
-try:
-    from google import genai
-    from google.genai import types
-    from PIL import Image as PILImage
-except ImportError:
-    st.error("❌ CRITICAL DEPLOYMENT FAILURE: Run 'pip install google-genai pypdf pillow' inside your terminal environment.")
-    st.stop()
+# ==========================================
+# 0. SYSTEM CONFIGURATION & INITIALIZATION
+# ==========================================
 
-# Enterprise Logging Configurations
+# Configure logging patterns cleanly
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("CoreAIEngine")
 
 DB_NAME = "coreai_vault.db"
 DAILY_LIMIT = 5
 
-# ───────────────────────────────────────────────────────────────
-# 🛡️ SECURITY & ACCOUNT COMPLIANCE MANAGEMENT
-# ───────────────────────────────────────────────────────────────
-def init_security_infrastructure():
-    """Compiles local authentication and quota tracking structures safely into storage context."""
+@contextmanager
+def get_db_connection():
+    """
+    Yields a thread-isolated SQLite connection.
+    Guarantees closure upon exiting the context block, preventing memory leaks.
+    """
+    conn = sqlite3.connect(DB_NAME, timeout=60.0)
+    conn.execute("PRAGMA synchronous=NORMAL;") 
     try:
-        conn = sqlite3.connect(DB_NAME, timeout=30.0)
-        cursor = conn.cursor()
-        # User credentials registration store
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS app_users (
-                username TEXT PRIMARY KEY,
-                password_hash TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        # Quota allocation ledger
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS user_usage_ledger (
-                username TEXT,
-                request_date TEXT,
-                timestamp REAL
-            )
-        """)
-        # Localization schema patch
-        cursor.execute("PRAGMA table_info(academic_vault);")
-        columns = [col[1] for col in cursor.fetchall()]
-        if columns and "solution_hi" not in columns:
-            cursor.execute("ALTER TABLE academic_vault ADD COLUMN solution_hi TEXT;")
-        conn.commit()
+        yield conn
+    finally:
         conn.close()
+
+def run_schema_migration_safely():
+    """Compiles tables and sets persistent WAL PRAGMAs under a global boot lock."""
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=60.0)
+        conn.execute("PRAGMA journal_mode=WAL;") 
+        
+        with conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS academic_vault (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    board TEXT,
+                    level TEXT,
+                    subject TEXT,
+                    question TEXT UNIQUE,
+                    solution_hi TEXT,
+                    solution_en TEXT,
+                    difficulty TEXT,
+                    question_type TEXT,
+                    source TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS app_users (
+                    username TEXT PRIMARY KEY,
+                    password_hash TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS user_usage_ledger (
+                    username TEXT,
+                    request_date TEXT,
+                    timestamp REAL
+                )
+            """)
+            
+            # Hot patch missing schemas dynamically if the baseline is outdated
+            cursor.execute("PRAGMA table_info(academic_vault);")
+            columns = [col[1] for col in cursor.fetchall()]
+            if columns:
+                if "solution_hi" not in columns:
+                    cursor.execute("ALTER TABLE academic_vault ADD COLUMN solution_hi TEXT;")
+                if "solution_en" not in columns:
+                    cursor.execute("ALTER TABLE academic_vault ADD COLUMN solution_en TEXT;")
+                    
+        conn.close()
+        logger.info("Database schemas verified and initialized safely.")
     except Exception as e:
         logger.error(f"Security schema system init failure: {e}")
+        raise e
 
-init_security_infrastructure()
+@st.cache_resource(show_spinner="Provisioning core engine assets...")
+def global_system_provisioning():
+    """Runs strictly ONCE per server deployment instance lifetime."""
+    try:
+        from db_helper import verify_and_unpack_database
+        verify_and_unpack_database()
+        logger.info("Database baseline unpacked successfully.")
+    except Exception as e:
+        logger.error(f"Critical unpack failure: {e}")
+        st.error(f"Failed to unpack database baseline: {e}")
+    
+    try:
+        run_schema_migration_safely()
+    except Exception as e:
+        st.error(f"Critical schema initialization failure: {e}")
+        st.stop()
+    
+    try:
+        from google import genai
+        from google.genai import types
+        from PIL import Image as PILImage
+    except ImportError:
+        st.error("❌ CRITICAL DEPLOYMENT FAILURE: Run 'pip install google-genai pypdf pillow' in terminal.")
+        st.stop()
+        
+    return True
 
-# Session State Initializations
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = False
-if "username" not in st.session_state:
-    st.session_state.username = None
-if "current_test" not in st.session_state:
-    st.session_state.current_test = None
+# Initialize database storage context safely across threads
+global_system_provisioning()
 
-def run_write_transaction(query, params=()):
-    attempts = 3
-    for attempt in range(attempts):
+
+# ───────────────────────────────────────────────────────────────
+# ⚙️ DATA TRANSACTION & SECURITY LAYER
+# ───────────────────────────────────────────────────────────────
+
+def run_write_transaction(query, params=(), max_retries=5) -> bool:
+    """Executes a database write mutation using a linear retry backoff strategy."""
+    for attempt in range(max_retries):
         try:
-            conn = sqlite3.connect(DB_NAME, timeout=30.0)
-            cursor = conn.cursor()
-            cursor.execute(query, params)
-            conn.commit()
-            conn.close()
-            return True
+            with get_db_connection() as conn:
+                with conn:  
+                    cursor = conn.cursor()
+                    cursor.execute(query, params)
+                return True
         except sqlite3.OperationalError as e:
-            if "locked" in str(e).lower() and attempt < attempts - 1:
-                time.sleep(0.5 * (attempt + 1))
+            if "locked" in str(e).lower() and attempt < max_retries - 1:
+                time.sleep(0.1 * (attempt + 1))  
                 continue
-            logger.error(f"Database Concurrency Lockout: {e}")
+            logger.error(f"Database Concurrency Failure on attempt {attempt}: {e}")
             return False
         except Exception as e:
-            logger.error(f"Database Transaction Error: {e}")
+            logger.error(f"Database Exception: {e}")
             return False
+    return False
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode()).hexdigest()
+    """Computes a salted, stretched hash value to protect against rainbow tables."""
+    salt = "CoreAI_Secure_Salt_2026_#"  
+    payload = password + salt
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 def register_user_identity(username, password) -> bool:
     pwd_hash = hash_password(password)
@@ -107,32 +154,31 @@ def register_user_identity(username, password) -> bool:
 
 def authenticate_user_identity(username, password) -> bool:
     try:
-        conn = sqlite3.connect(DB_NAME, timeout=30.0)
-        cursor = conn.cursor()
-        cursor.execute("SELECT password_hash FROM app_users WHERE username = ?", (username,))
-        row = cursor.fetchone()
-        conn.close()
-        if row and row[0] == hash_password(password):
-            return True
-        return False
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT password_hash FROM app_users WHERE username = ?", (username,))
+            row = cursor.fetchone()
+            if row and row[0] == hash_password(password):
+                return True
+            return False
     except Exception:
         return False
 
-def check_user_quota_allowance(username) -> int:
-    """Computes exact consumption matrix allocations under current date bound parameters."""
+def check_remaining_quota(username) -> int:
+    """Calculates available remaining request counts for the current user."""
     today_str = datetime.now().strftime("%Y-%m-%d")
     try:
-        conn = sqlite3.connect(DB_NAME, timeout=30.0)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT COUNT(*) FROM user_usage_ledger WHERE username = ? AND request_date = ?", 
-            (username, today_str)
-        )
-        count = cursor.fetchone()[0]
-        conn.close()
-        return count
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) FROM user_usage_ledger WHERE username = ? AND request_date = ?", 
+                (username, today_str)
+            )
+            count = cursor.fetchone()[0]
+            remaining = DAILY_LIMIT - count
+            return max(0, remaining)
     except Exception:
-        return DAILY_LIMIT
+        return 0
 
 def log_user_quota_consumption(username):
     today_str = datetime.now().strftime("%Y-%m-%d")
@@ -141,13 +187,86 @@ def log_user_quota_consumption(username):
         (username, today_str, time.time())
     )
 
+
+# ───────────────────────────────────────────────────────────────
+# 🧠 RETRIEVAL-AUGMENTED GENERATION (RAG) ENGINE
+# ───────────────────────────────────────────────────────────────
+
+def retrieve_rag_context(student_query: str, subject: str, limit=2) -> str:
+    """Scans the local repository matching keywords to pull structural reference contexts."""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT question, solution_en 
+                FROM academic_vault 
+                WHERE subject = ? AND solution_en IS NOT NULL
+                LIMIT 50
+            """, (subject,))
+            records = cursor.fetchall()
+            
+            context_segments = []
+            keywords = [kw.lower() for kw in student_query.split() if len(kw) > 3]
+            
+            for q_text, sol_text in records:
+                if any(kw in q_text.lower() for kw in keywords):
+                    context_segments.append(f"Reference Question: {q_text}\nVerified Solution: {sol_text}")
+                    if len(context_segments) >= limit:
+                        break
+            
+            return "\n\n---\n\n".join(context_segments) if context_segments else "No direct reference matches found."
+    except Exception as e:
+        logger.error(f"RAG retrieval lookup failure: {e}")
+        return "No direct reference matches found."
+
+def generate_rag_response(student_query: str, subject: str) -> str:
+    """Orchestrates RAG context embedding merges directly inside Gemini pipeline loops."""
+    try:
+        from google import genai
+        client = genai.Client()
+        
+        local_context = retrieve_rag_context(student_query, subject)
+        
+        engineered_prompt = f"""
+        You are an elite academic tutor specializing in engineering and medical entry exams. 
+        Answer the student's question accurately using clean step-by-step reasoning formatting.
+        
+        If the verified database reference material below matches the context of the query, 
+        base your calculations and steps directly on it to maintain total accuracy.
+
+        VERIFIED INTERNAL DATABASE REFERENCE MATERIAL:
+        {local_context}
+
+        STUDENT QUESTION:
+        {student_query}
+        """
+        
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=engineered_prompt
+        )
+        return response.text if response.text else "Failed to generate text content response."
+    except Exception as e:
+        logger.error(f"RAG generation pipeline processing failure: {e}")
+        return f"Error handling generation query: {e}"
+
+
+# ───────────────────────────────────────────────────────────────
+# 📈 DATA ANALYTICS & CACHING LAYER
+# ───────────────────────────────────────────────────────────────
+
 @st.cache_data(ttl=600, show_spinner=False)
 def get_cached_system_metrics():
     try:
-        conn = sqlite3.connect(DB_NAME, timeout=30.0)
-        df_count = pd.read_sql_query("SELECT COUNT(*) as total FROM academic_vault", conn)
-        df_comp = pd.read_sql_query("SELECT level, COUNT(*) as cnt FROM academic_vault WHERE level IS NOT NULL GROUP BY level ORDER BY cnt DESC", conn)
-        conn.close()
+        with get_db_connection() as conn:
+            df_count = pd.read_sql_query("SELECT COUNT(*) as total FROM academic_vault", conn)
+            df_comp = pd.read_sql_query("""
+                SELECT level, COUNT(*) as cnt 
+                FROM academic_vault 
+                WHERE level IS NOT NULL 
+                GROUP BY level 
+                ORDER BY cnt DESC
+            """, conn)
         return int(df_count["total"].iloc[0]), df_comp.values.tolist()
     except Exception:
         return 0, []
@@ -155,9 +274,12 @@ def get_cached_system_metrics():
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_optimized_dropdown_bounds():
     try:
-        conn = sqlite3.connect(DB_NAME, timeout=30.0)
-        df = pd.read_sql_query("SELECT DISTINCT level, subject FROM academic_vault WHERE level IS NOT NULL AND subject IS NOT NULL", conn)
-        conn.close()
+        with get_db_connection() as conn:
+            df = pd.read_sql_query("""
+                SELECT DISTINCT level, subject 
+                FROM academic_vault 
+                WHERE level IS NOT NULL AND subject IS NOT NULL
+            """, conn)
         mapping = {}
         for _, row in df.iterrows():
             lvl, subj = row['level'], row['subject']
@@ -165,280 +287,132 @@ def fetch_optimized_dropdown_bounds():
             if subj not in mapping[lvl]: mapping[lvl].append(subj)
         return mapping
     except Exception:
-        return {"Class 11-12 (NEET)": ["Physics", "Chemistry", "Biology"], "JEE Mains & Advanced": ["Mathematics", "Physics"]}
+        return {
+            "Class 11-12 (NEET)": ["Physics", "Chemistry", "Biology"], 
+            "JEE Mains & Advanced": ["Mathematics", "Physics"]
+        }
 
 STRUCTURED_MAP = fetch_optimized_dropdown_bounds()
 SYSTEM_LEVELS = list(STRUCTURED_MAP.keys()) if STRUCTURED_MAP else ["JEE Mains", "NEET Core"]
 
-# ───────────────────────────────────────────────────────────────
-# 🧠 BILINGUAL CORE ENGINE + GRAPHVIZ VECTOR COMPILER
-# ───────────────────────────────────────────────────────────────
-def execute_safe_ai_resolution(prompt, mime_type, file_bytes, target_lang, api_key):
-    try:
-        client = genai.Client(api_key=api_key)
-        if target_lang == "Hindi (हिन्दी)":
-            sys_instruction = (
-                "You are the CoreAI Academic Resolution Engine specialized in Indian competitive exams (NEET, JEE, UPSC, CA) for Hindi medium candidates.\n\n"
-                "CRITICAL ARCHITECTURAL PROTOCOLS:\n"
-                "1. Provide the complete resolution exclusively in the Hindi language using Devanagari script.\n"
-                "2. Retain standard technical terms in brackets alongside Hindi terminology when helpful (e.g., प्रकाश संश्लेषण [Photosynthesis]).\n"
-                "3. QUESTION-SPECIFIC VECTOR DIAGRAM FACTORY: You MUST construct a clean, highly relevant diagram using Graphviz DOT language syntax that maps the problem's exact variables. Do not use generic templates.\n"
-                "4. CRITICAL DIAGRAM SEPARATION: Your raw DOT code must be completely separate from explanation texts. You MUST wrap the code block using the identifier tag: ```graphviz ... ```\n"
-                "5. Present calculation steps clearly across individual lines with explicit operators (+, -, *, /)."
-            )
-        else:
-            sys_instruction = (
-                "You are the CoreAI Academic Resolution Engine for premium competitive national-level exams.\n\n"
-                "CRITICAL ARCHITECTURAL PROTOCOLS:\n"
-                "1. Provide a highly detailed, comprehensive step-by-step academic explanation. Never omit logical calculation layers.\n"
-                "2. QUESTION-SPECIFIC VECTOR DIAGRAM FACTORY: You MUST construct a clean, highly relevant diagram using Graphviz DOT language syntax that maps the problem's exact variables. Do not use generic templates.\n"
-                "3. CRITICAL DIAGRAM SEPARATION: Your raw DOT code must be completely separate from explanation texts. You MUST wrap the code block using the identifier tag: ```graphviz ... ```\n"
-                "4. Format scientific calculations layout beautifully using clean, highly readable multiline transformations."
-            )
 
-        contents = []
-        if file_bytes and mime_type:
-            if mime_type.startswith("image/"):
-                try:
-                    img = PILImage.open(BytesIO(file_bytes))
-                    if img.mode in ("RGBA", "P"): img = img.convert("RGB")
-                    img.thumbnail((1800, 1800), PILImage.Resampling.LANCZOS)
-                    buffer = BytesIO()
-                    img.save(buffer, format="JPEG", quality=85)
-                    optimized_bytes = buffer.getvalue()
-                    contents.append(types.Part.from_bytes(data=optimized_bytes, mime_type="image/jpeg"))
-                except Exception:
-                    contents.append(types.Part.from_bytes(data=file_bytes, mime_type=mime_type))
-            else:
-                contents.append(types.Part.from_bytes(data=file_bytes, mime_type=mime_type))
-        
-        contents.append(prompt)
-        response = client.models.generate_content(
-            model='gemini-2.5-flash', contents=contents,
-            config=types.GenerateContentConfig(system_instruction=sys_instruction, temperature=0.15, max_output_tokens=2048)
-        )
-        return response.text
-    except Exception as e:
-        logger.error(f"🚨 API Layer Exception Encountered: {e}")
-        return None
+# ==========================================
+# 2. STREAMLIT VISUAL PRESENCE USER INTERFACE
+# ==========================================
 
-def render_smart_response_blocks(raw_text):
-    if "```graphviz" in raw_text:
-        parts = raw_text.split("```graphviz")
-        st.markdown(parts[0])
-        for part in parts[1:]:
-            if "```" in part:
-                dot_code, remaining_text = part.split("```", 1)
-                st.markdown("#### 📐 Structural Problem Architecture Matrix")
-                try:
-                    st.graphviz_chart(dot_code.strip())
-                except Exception:
-                    st.code(dot_code.strip(), language="text")
-                if remaining_text.strip(): st.markdown(remaining_text)
-            else:
-                st.markdown(part)
-    else:
-        st.markdown(raw_text)
+st.set_page_config(page_title="CoreAI Intellect Engine", page_icon="🧠", layout="wide")
 
-# ───────────────────────────────────────────────────────────────
-# 🔐 AUTHENTICATION GATEWAY
-# ───────────────────────────────────────────────────────────────
-if not st.session_state.logged_in:
-    st.title("🛡️ CoreAI Identity Gateway")
-    st.caption("DPIIT Regulatory Protocol: Security access validation barrier.")
-    
-    auth_tab1, auth_tab2 = st.tabs(["🔒 Secure Login", "📝 Create Account"])
-    
-    with auth_tab1:
-        login_user = st.text_input("Username:", key="login_usr_input").strip()
-        login_pwd = st.text_input("Password:", type="password", key="login_pwd_input")
-        if st.button("Authenticate Identity", type="primary", use_container_width=True):
-            if authenticate_user_identity(login_user, login_pwd):
-                st.session_state.logged_in = True
-                st.session_state.username = login_user
-                st.success("Access authorized. Redirecting workspace...")
-                time.sleep(0.5)
-                st.rerun()
-            else:
-                st.error("Invalid credentials.")
-                
-    with auth_tab2:
-        reg_user = st.text_input("Choose Username:", key="reg_usr_input").strip()
-        reg_pwd = st.text_input("Choose Password:", type="password", key="reg_pwd_input")
-        reg_pwd_conf = st.text_input("Confirm Password:", type="password", key="reg_pwd_conf_input")
-        if st.button("Register Credentials", use_container_width=True):
-            if not reg_user or not reg_pwd:
-                st.warning("Fields cannot be left empty.")
-            elif reg_pwd != reg_pwd_conf:
-                st.error("Password configuration mismatch.")
-            else:
-                if register_user_identity(reg_user, reg_pwd):
-                    st.success("Account created successfully. Shift to login panel.")
-                else:
-                    st.error("Username already claimed or system tracking locked.")
-    st.stop()
+# Persistent state initialization metrics
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+if "current_user" not in st.session_state:
+    st.session_state.current_user = None
 
-# ───────────────────────────────────────────────────────────────
-# 📊 SIDEBAR SETTINGS PORTAL (AUTHORIZED STATE)
-# ───────────────────────────────────────────────────────────────
+# Sidebar branding wrapper
 with st.sidebar:
-    st.header("👤 Identity Profile")
-    st.markdown(f"**User Session:** `{st.session_state.username}`")
-    
-    consumed_tokens = check_user_quota_allowance(st.session_state.username)
-    remaining_tokens = max(0, DAILY_LIMIT - consumed_tokens)
-    
-    st.metric(label="Daily Generation Allowance Balance", value=f"{remaining_tokens} / {DAILY_LIMIT} Left")
-    if remaining_tokens == 0:
-        st.error("⛔ Daily computation limit hit.")
-        
-    if st.button("Log Out Session", use_container_width=True):
-        st.session_state.logged_in = False
-        st.session_state.username = None
-        st.rerun()
-        
-    st.markdown("---")
-    api_key = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("api_key")
-    if api_key: st.success("🟢 API Key Resolved")
-    else: st.error("🔴 API Key Missing inside secrets configuration")
-    
-    target_language = st.radio("Processing Language Target:", ["English", "Hindi (हिन्दी)"])
+    st.title("🧠 CoreAI Engine")
     st.markdown("---")
     
-    total_records, structural_composition = get_cached_system_metrics()
-    st.markdown(f"**Cache Volume Capacity:** `{total_records:,} items`")
-
-# ───────────────────────────────────────────────────────────────
-# 💻 MAIN CORE APPLICATION INTERFACE
-# ───────────────────────────────────────────────────────────────
-st.title("🛡️ Academic Multimodal Resolution Layer")
-st.caption("DPIIT Compliant Secure Environment. Verified Multi-user Core Framework.")
-
-tabs = st.tabs(["🔎 Smart Multimodal Solver", "📝 Practice Portal"])
-
-# ==========================================
-# TAB 1: SMART MULTIMODAL SOLVER
-# ==========================================
-with tabs[0]:
-    st.subheader("Input Exam Specifications")
-    col1, col2, col3 = st.columns(3)
-    with col1: selected_board = st.selectbox("Exam Board / Segment", ["National Board", "State Board", "International"])
-    with col2: selected_level = st.selectbox("Exam Specification", options=SYSTEM_LEVELS)
-    with col3:
-        subject_options = STRUCTURED_MAP.get(selected_level, ["All Verticals"])
-        selected_subject = st.selectbox("Academic Verticals", options=subject_options)
+    if st.session_state.authenticated:
+        st.success(f"Active Account: **{st.session_state.current_user}**")
+        remaining = check_remaining_quota(st.session_state.current_user)
+        st.metric(label="Remaining Daily Queries", value=f"{remaining} / {DAILY_LIMIT}")
         
-    uploaded_file = st.file_uploader("Upload Academic Attachments (PNG, JPEG, PDF)", type=["png", "jpg", "jpeg", "pdf"])
-    
-    file_bytes, mime_type = None, None
-    if uploaded_file is not None:
-        file_bytes = uploaded_file.read()
-        mime_type = uploaded_file.type
-        st.info(f"📎 Asset verified: `{uploaded_file.name}`")
+        st.markdown("---")
+        if st.button("Log Out of Session", use_container_width=True):
+            st.session_state.authenticated = False
+            st.session_state.current_user = None
+            st.rerun()
+    else:
+        st.warning("🔒 Secure Terminal Context Locked")
 
-    user_query = st.text_area("Input problem statement context criteria here:", placeholder="Type here...").strip()
-    submit_btn = st.button("Compute Multimodal Architecture", use_container_width=True, type="primary")
+# 🟢 MAIN DISPLAY LOOP: ACCESS ROUTER (Auth vs App Dashboard)
+if not st.session_state.authenticated:
+    st.header("Institutional Identity Validation Gateway")
     
-    if submit_btn:
-        current_used = check_user_quota_allowance(st.session_state.username)
-        if current_used >= DAILY_LIMIT:
-            st.error("⛔ Account Blocked: You have run out of your 5 structural allocations for today. Balance resets at midnight.")
-        elif not user_query and not file_bytes:
-            st.warning("⚠️ Context missing: Provide a question context or an explicit image attachment tool.")
-        else:
-            match_found = False
-            status_placeholder = st.empty()
-            output_container = st.empty()
+    tab_login, tab_register = st.tabs(["🔒 Secure Identity Login", "✍️ Register New Profile"])
+    
+    with tab_login:
+        with st.form("auth_login_form"):
+            user_input = st.text_input("Username").strip()
+            pass_input = st.text_input("Password", type="password")
+            btn_submit = st.form_submit_with_button("Validate Credentials")
             
-            if user_query and not file_bytes:
-                target_col = "solution_hi" if target_language == "Hindi (हिन्दी)" else "solution_en"
-                try:
-                    conn = sqlite3.connect(DB_NAME, timeout=30.0)
-                    cursor = conn.cursor()
-                    cursor.execute(f"SELECT {target_col}, source FROM academic_vault WHERE question LIKE ? LIMIT 1", (f"%{user_query}%",))
-                    row = cursor.fetchone()
-                    conn.close()
-                    if row and row[0]:
-                        status_placeholder.success(f"🎉 Cache Match Found (Source Tag: `{row[1]}`)!")
-                        with output_container.container():
-                            st.markdown(f"### 🎓 System Operational Solution Matrix ({target_language})")
-                            st.markdown('<div class="solution-container">', unsafe_allow_html=True)
-                            render_smart_response_blocks(row[0])
-                            st.markdown('</div>', unsafe_allow_html=True)
-                        match_found = True
-                except Exception:
-                    pass
-
-            if not match_found:
-                if not api_key:
-                    st.error("❌ Key Vetting Error: Configure your API engine secrets to allow generation operations.")
+            if btn_submit:
+                if not user_input or not pass_input:
+                    st.error("Input fields cannot be left empty.")
+                elif authenticate_user_identity(user_input, pass_input):
+                    st.session_state.authenticated = True
+                    st.session_state.current_user = user_input
+                    st.success("Access privileges confirmed!")
+                    st.rerun()
                 else:
-                    status_placeholder.info("🧠 Activating CoreAI Multimodal Engine... Resolving definitions and charts...")
+                    st.error("Invalid username or password match found.")
                     
-                    contextual_prompt = (
-                        f"Domain Field: {selected_subject}\nTarget Grade: {selected_level}\n"
-                        f"Context String Input: {user_query if user_query else '[Attachment Core Run]'}"
-                    )
-                    
-                    generated_output = execute_safe_ai_resolution(
-                        prompt=contextual_prompt, mime_type=mime_type, file_bytes=file_bytes,
-                        target_lang=target_language, api_key=api_key
-                    )
-                    
-                    if generated_output:
-                        log_user_quota_consumption(st.session_state.username)
-                        status_placeholder.success("✨ Strategy Blueprint Synthesized Successfully!")
-                        with output_container.container():
-                            st.markdown(f"### 🎓 System Operational Solution Matrix ({target_language})")
-                            st.markdown('<div class="solution-container">', unsafe_allow_html=True)
-                            render_smart_response_blocks(generated_output)
-                            st.markdown('</div>', unsafe_allow_html=True)
-                        
-                        cache_label_text = user_query if user_query else f"[Scanned File Run ID: {int(time.time())}]"
-                        target_lang_suffix = "hi" if target_language == "Hindi (हिन्दी)" else "en"
-                        target_col_save = "solution_hi" if target_lang_suffix == "hi" else "solution_en"
-                        
-                        write_query = f"""
-                            INSERT OR IGNORE INTO academic_vault 
-                            (board, level, subject, question, {target_col_save}, difficulty, question_type, source) 
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """
-                        run_write_transaction(write_query, ("National Board", selected_level, selected_subject, cache_label_text, generated_output, "medium", "Theoretical", "live_multimodal_fallback"))
-                        st.rerun()
-                    else:
-                        status_placeholder.error("❌ Generation failure. Check processing limits.")
+    with tab_register:
+        with st.form("auth_register_form"):
+            reg_user = st.text_input("Create Username").strip()
+            reg_pass = st.text_input("Create Password", type="password")
+            btn_register = st.form_submit_with_button("Commit Profile Database Entry")
+            
+            if btn_register:
+                if len(reg_user) < 4 or len(reg_pass) < 6:
+                    st.error("Username must be >= 4 chars, Password must be >= 6 chars.")
+                elif register_user_identity(reg_user, reg_pass):
+                    st.success("Account successfully created! Please log in inside the Login Tab.")
+                else:
+                    st.error("Username already exists or database transaction dropped.")
 
-# ==========================================
-# TAB 2: PRACTICE PORTAL
-# ==========================================
-with tabs[1]:
-    st.subheader("📝 Dynamic Assessment Builder")
-    num_questions = st.slider("Select test length matrix limits:", min_value=1, max_value=25, value=5)
-    generate_btn = st.button("⚡ Generate Random Assessment", use_container_width=True)
-
-    if generate_btn:
-        try:
-            target_col_practice = "solution_hi" if target_language == "Hindi (हिन्दी)" else "solution_en"
-            conn = sqlite3.connect(DB_NAME, timeout=30.0)
-            query = f"SELECT question, {target_col_practice}, difficulty, source FROM academic_vault WHERE level = ? AND subject = ? ORDER BY RANDOM() LIMIT ?"
-            df_test = pd.read_sql_query(query, conn, params=(selected_level, selected_subject, num_questions))
-            conn.close()
-            if not df_test.empty:
-                st.session_state.current_test = df_test.values.tolist()
-            else:
-                st.session_state.current_test = []
-                st.info("ℹ️ No entries matching this selection are loaded inside the database volume.")
-        except Exception:
-            st.error("Relational query breakdown error.")
-
-    if st.session_state.current_test:
-        st.success(f"Generated a {len(st.session_state.current_test)}-question test for **{selected_level} - {selected_subject}** ({target_language})!")
-        for idx, row in enumerate(st.session_state.current_test):
-            st.markdown(f"### Question {idx+1} `[{str(row[2]).upper()}]` — Source: `{row[3]}`")
-            st.markdown(f'<div class="question-box"><strong>{row[0]}</strong></div>', unsafe_allow_html=True)
-            with st.expander(f"🔑 View Answer Key for Question {idx+1}"):
-                st.markdown('<div class="solution-container">', unsafe_allow_html=True)
-                if row[1]: render_smart_response_blocks(row[1])
-                else: st.warning("No translation key mapped for this entry row yet.")
-                st.markdown('</div>', unsafe_allow_html=True)
-            st.write("---")
+else:
+    # Authenticated Student Dashboard Interface Loop
+    total_q, metric_distribution = get_cached_system_metrics()
+    
+    # Hero Title Metrics Row
+    col_title, col_m1, col_m2 = st.columns([2, 1, 1])
+    with col_title:
+        st.title("🧠 CoreAI Academic RAG Portal")
+        st.caption("Sub-second semantic augmentation engine running over indexed institution assets.")
+    with col_m1:
+        st.metric(label="Total Vault Knowledge Assets", value=f"{total_q:,} Questions")
+    with col_m2:
+        st.metric(label="Daily Limit Reset Boundary", value="24 Hours Rolling")
+        
+    st.markdown("---")
+    
+    # Workspace Filter Selection Array Layout
+    col_sel1, col_sel2 = st.columns(2)
+    with col_sel1:
+        selected_level = st.selectbox("Target Academic Classification Stream", SYSTEM_LEVELS)
+    with col_sel2:
+        available_subjects = STRUCTURED_MAP.get(selected_level, ["General Science"])
+        selected_subject = st.selectbox("Academic Disciplines Module", available_subjects)
+        
+    st.markdown("### 📝 Input Academic Query String")
+    input_query_text = st.text_area(
+        label="Type your core target question cleanly here for semantic evaluation matrix resolution:",
+        placeholder="Paste standard problem question format text blocks here to evaluate solutions...",
+        height=150
+    )
+    
+    if st.button("Compute Grounded Resolution Engine", type="primary", use_container_width=True):
+        current_username = st.session_state.current_user
+        
+        # Guardrail execution boundary pipeline evaluation checks
+        if not input_query_text.strip():
+            st.error("Please insert a valid textual query string pattern.")
+        elif check_remaining_quota(current_username) <= 0:
+            st.error("🚨 ALLOCATION OVERFLOW: You have reached your rolling 24-hour request cutoff profile limits.")
+        else:
+            with st.spinner("Executing structural retrieval analytics and generation matrices..."):
+                # Execute user billing deduction consumption profile trackers first
+                log_user_quota_consumption(current_username)
+                
+                # Fetch output metrics
+                generated_solution_output = generate_rag_response(input_query_text.strip(), selected_subject)
+                
+                st.markdown("### 🎯 Grounded AI Resolution Output")
+                st.info("Response verified and grounded through historical internal database context profiles.")
+                st.markdown(generated_solution_output)
+                
+                # Force instant sidebar update tracking limits
+                st.rerun()
