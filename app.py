@@ -1,132 +1,294 @@
+
 # ==========================================
 # 1. AUTOMATIC CLOUD DATABASE UNPACKER
 # ==========================================
+import os
 from db_helper import verify_and_unpack_database
 verify_and_unpack_database()
 # ==========================================
 
-
-
-
-
 import streamlit as st
 import sqlite3
-import datetime
-import numpy as np
-import matplotlib.pyplot as plt
+import pandas as pd
+import requests
+import time
 
 DB_NAME = "coreai_vault.db"
 
-st.set_page_config(page_title="CoreAI Academic Engine", layout="wide", page_icon="🔍")
+# Page configuration
+st.set_page_config(
+    page_title="CoreAI Academic Engine",
+    page_icon="🎓",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# Utility function for fast database lookup queries
+# Custom Styling to match your premium workspace
+st.markdown("""
+    <style>
+    .main {
+        background-color: #0f1116;
+        color: #e2e8f0;
+    }
+    .metric-card {
+        background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+        border: 1px solid #334155;
+        border-radius: 12px;
+        padding: 20px;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        text-align: center;
+    }
+    .metric-value {
+        font-size: 2.2rem;
+        font-weight: 700;
+        color: #38bdf8;
+    }
+    .metric-label {
+        font-size: 0.9rem;
+        color: #94a3b8;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+    }
+    .question-box {
+        background-color: #1e293b;
+        border-left: 5px solid #38bdf8;
+        border-radius: 6px;
+        padding: 18px;
+        margin-bottom: 15px;
+    }
+    .explanation-box {
+        background-color: #0f172a;
+        border: 1px dashed #475569;
+        border-radius: 6px;
+        padding: 18px;
+        margin-top: 10px;
+        color: #cbd5e1;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# ───────────────────────────────────────────────────────────────
+# DATABASE UTILITY FUNCTIONS
+# ───────────────────────────────────────────────────────────────
 def run_query(query, params=(), fetchall=True):
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute(query, params)
-    data = cursor.fetchall() if fetchall else cursor.fetchone()
-    conn.commit()
-    conn.close()
-    return data
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        if fetchall:
+            result = cursor.fetchall()
+        else:
+            conn.commit()
+            result = cursor.fetchone()
+        conn.close()
+        return result
+    except Exception as e:
+        st.error(f"Database Error: {e}")
+        return []
 
-# Local Repository Search Algorithm
-def local_fuzzy_lookup(user_input):
-    # Searches the cached database via simple string containment rules
-    row = run_query("""
-    SELECT solution_en, solution_hi, diagram_code FROM academic_vault 
-    WHERE question LIKE ? LIMIT 1
-    """, (f"%{user_input}%",), fetchall=False)
-    return row
+def get_dynamic_levels():
+    """Fetches all unique exam specifications present in the database."""
+    query = "SELECT DISTINCT level FROM academic_vault WHERE level IS NOT NULL AND level != '' ORDER BY level ASC"
+    rows = run_query(query)
+    levels = [r[0] for r in rows]
+    if not levels:
+        return ["Class 11-12 (NEET)", "JEE Mains & Advanced", "Banking (IBPS/SBI)", "UPSC Civil Services", "CA/CS/CMA"]
+    return levels
 
-# Main App Shell Rendering
-st.title("🛡️ CoreAI Academic SaaS Engine")
-st.caption("Enterprise-Grade Bilingual Learning Infrastructure Optimized for DPIIT Vetting Panels")
+def get_dynamic_subjects(level):
+    """Fetches all subjects available for a chosen exam specification."""
+    query = "SELECT DISTINCT subject FROM academic_vault WHERE level = ? AND subject IS NOT NULL AND subject != '' ORDER BY subject ASC"
+    rows = run_query(query, (level,))
+    subjects = [r[0] for r in rows]
+    if not subjects:
+        return ["All Verticals"]
+    return subjects
 
-# Tab Layout System
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["🔍 AI Solver", "📝 Test Center", "📊 Analytics Hub", "💳 Premium Tiers", "👤 Account"])
+# ───────────────────────────────────────────────────────────────
+# LIVE GEMINI FALLBACK API ENGINE (WITH BACKOFF)
+# ───────────────────────────────────────────────────────────────
+def generate_gemini_resolution(prompt, api_key):
+    """Calls Gemini API using exponential backoff with robust fallbacks."""
+    # System prompt to ensure professional competitive format
+    system_instruction = (
+        "You are the CoreAI Academic Resolution Engine. "
+        "Provide a highly detailed, accurate, step-by-step academic explanation "
+        "suitable for competitive national-level exams (NEET, JEE, UPSC, CA)."
+    )
+    
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={api_key}"
+    headers = {"Content-Type": "application/json"}
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "systemInstruction": {"parts": [{"text": system_instruction}]}
+    }
+    
+    # Exponential backoff: 1s, 2s, 4s, 8s, 16s
+    delays = [1, 2, 4, 8, 16]
+    for delay in delays:
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            if response.status_code == 200:
+                result = response.json()
+                text = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                if text:
+                    return text
+        except Exception:
+            pass
+        time.sleep(delay)
+        
+    # Standard Model Fallback
+    fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={api_key}"
+    try:
+        response = requests.post(fallback_url, headers=headers, json=payload, timeout=30)
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+    except Exception:
+        pass
+        
+    return None
 
-with tab1:
-    st.header("Academic Question Resolution Layer")
+def save_new_question_to_vault(level, subject, question, answer):
+    """Learns and appends live resolutions directly to your local database on-the-fly."""
+    query = """
+    INSERT OR IGNORE INTO academic_vault 
+    (board, level, subject, question, solution_en, difficulty, question_type, source) 
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    run_query(query, ("National Board", level, subject, question, answer, "medium", "Theoretical", "live_gemini_fallback"), fetchall=False)
+
+# ───────────────────────────────────────────────────────────────
+# API KEY RESOLUTION (STREAMLIT SECRETS + FALLBACK)
+# ───────────────────────────────────────────────────────────────
+api_key = None
+if hasattr(st, "secrets"):
+    # Scans for standard permutations of your key
+    api_key = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("api_key")
+
+# Sidebar Stats Portal
+with st.sidebar:
+    st.header("📊 CoreAI System Matrix")
+    
+    # Status Indicators
+    if api_key:
+        st.markdown("🟢 **Gemini Live Fallback:** `Active`")
+    else:
+        st.markdown("🔴 **Gemini Live Fallback:** `Inactive (Enter Secrets)`")
+        
+    total_q_row = run_query("SELECT COUNT(*) FROM academic_vault", fetchall=False)
+    total_q = total_q_row[0] if total_q_row else 0
+    
+    st.markdown(f"""
+    <div class="metric-card">
+        <div class="metric-value">{total_q:,}</div>
+        <div class="metric-label">Vault Capacity</div>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    st.markdown("<br>", unsafe_allow_html=True)
+    st.write("📌 **System Composition:**")
+    composition = run_query("SELECT level, COUNT(*) FROM academic_vault GROUP BY level ORDER BY COUNT(*) DESC")
+    for lvl, cnt in composition:
+        st.markdown(f"**{lvl}**: `{cnt:,} questions`")
+
+# ───────────────────────────────────────────────────────────────
+# MAIN USER INTERFACE
+# ───────────────────────────────────────────────────────────────
+st.title("🛡️ Academic Question Resolution Layer")
+st.caption("Dual-Core Processing: Searches 420k+ offline records instantly, with automated live AI generation.")
+
+tabs = st.tabs(["🔎 Smart Question Solver", "📝 Practice Portal"])
+
+# ==========================================
+# TAB 1: SMART QUESTION SOLVER
+# ==========================================
+with tabs[0]:
+    st.subheader("Input Exam Specifications")
     
     col1, col2, col3 = st.columns(3)
     with col1:
-        board = st.selectbox("Exam Board / Segment", ["National Board", "State Board", "Professional Foundations"])
+        selected_board = st.selectbox("Exam Board / Segment", ["National Board", "State Board", "International"])
     with col2:
-        level = st.selectbox("Exam Specification", ["Class 11-12 (NEET)", "Banking (IBPS/SBI)", "SSC (CGL/CHSL)", "CA/CS Entrance"])
+        available_levels = get_dynamic_levels()
+        selected_level = st.selectbox("Exam Specification", options=available_levels)
     with col3:
-        subject = st.selectbox("Academic Verticals", ["Quantitative Aptitude", "Reasoning & Logic", "Accountancy & Law", "Advanced Biology"])
+        available_subjects = get_dynamic_subjects(selected_level)
+        selected_subject = st.selectbox("Academic Verticals", options=available_subjects)
         
-    query_text = st.text_area("Input your complex exam question or problem case scenario here:", height=100)
+    user_query = st.text_area(
+        "Input your complex exam question or problem case scenario here:",
+        placeholder="Type or paste your question (e.g., 'WHAT IS PHOTOSYNTHESIS ?')"
+    ).strip()
     
-    if st.button("Compute Step-by-Step Architecture"):
-        if query_text.strip():
-            # Check local repository cache matrices
-            cache_hit = local_fuzzy_lookup(query_text)
+    submit_btn = st.button("Compute Step-by-Step Architecture", use_container_width=True)
+    
+    if submit_btn and user_query:
+        # Search the database for exact or near matching questions
+        search_query = "SELECT solution_en, source FROM academic_vault WHERE question LIKE ? LIMIT 1"
+        match = run_query(search_query, (f"%{user_query}%",))
+        
+        if match:
+            solution, source = match[0]
+            st.success(f"🎉 Direct Match Found in Database (Source: `{source}`)!")
+            st.markdown(f"""
+            <div class="explanation-box">
+                <strong>Step-by-Step Explanation:</strong><br><br>
+                {solution}
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            # Activate live fallback engine
+            st.info("🔎 Item not matched in the initial database. Activating Live Fallback API Engine...")
             
-            if cache_hit:
-                st.success("⚡ Data retrieved instantly from Local Ledger Cache Matrix (₹0 Token Costs!).")
-                sol_en, sol_hi, diag = cache_hit
-                
-                lang_en, lang_hi = st.tabs(["🇬🇧 English Explanation", "🇮🇳 हिंदी व्याख्या"])
-                with lang_en:
-                    st.write(sol_en)
-                with lang_hi:
-                    st.write(sol_hi)
-                    
-                # Generate dynamic diagrams for STEM modules
-                if "Biology" in subject or "Quantitative" in subject:
-                    st.subheader("📊 Dynamic Visual Map")
-                    fig, ax = plt.subplots(figsize=(5, 2))
-                    ax.plot(np.linspace(0, 10, 100), np.sin(np.linspace(0, 10, 100)), color='crimson', label="Performance Curve")
-                    ax.set_title(f"{subject} Reference Projection Map")
-                    ax.legend()
-                    st.pyplot(fig)
+            if not api_key:
+                st.warning("⚠️ Enter your API Key integration details on Streamlit Secrets to handle active global external generation.")
             else:
-                st.info("🔍 Item not matched in the initial 150k repository. Activating Live Fallback API Engine...")
-                # Fallback structure logic container
-                st.warning("⚠️ Enter your API Key integration details to handle active global external generation.")
-        else:
-            st.error("Please enter a question string to compute.")
+                with st.spinner("🧠 Generating step-by-step academic resolution key via Gemini..."):
+                    generated_solution = generate_gemini_resolution(
+                        f"Subject: {selected_subject}, Level: {selected_level}. Question: {user_query}", 
+                        api_key
+                    )
+                    
+                    if generated_solution:
+                        st.success("✨ Resolution Key Generated Successfully!")
+                        st.markdown(f"""
+                        <div class="explanation-box">
+                            <strong>Step-by-Step Explanation (Live Fallback):</strong><br><br>
+                            {generated_solution}
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        # Save back to database so next time it is instant
+                        save_new_question_to_vault(selected_level, selected_subject, user_query, generated_solution)
+                    else:
+                        st.error("❌ Failed to reach the fallback API. Please check your internet connection or API Key limits.")
 
-with tab2:
-    st.header("Adaptive Mock Assessment Canvas")
-    if st.button("Generate Random 5-Question Test Module"):
-        questions = run_query("SELECT question, solution_en FROM academic_vault ORDER BY RANDOM() LIMIT 5")
-        if questions:
-            for idx, q in enumerate(questions):
-                st.markdown(f"**Q{idx+1}: {q[0]}**")
-                with st.expander("Reveal Analytical Matrix"):
-                    st.info(q[1])
-        else:
-            st.error("Data Vault is empty. Execute the 'auto_build_db.py' process first.")
-
-with tab3:
-    st.header("Operational Telemetry & Performance Charts")
-    c1, c2, c3 = st.columns(3)
+# ==========================================
+# TAB 2: PRACTICE PORTAL
+# ==========================================
+with tabs[1]:
+    st.subheader("📝 Dynamic Assessment Builder")
     
-    # Extract structural metrics directly from local tracking infrastructure
-    total_cached = run_query("SELECT COUNT(*) FROM academic_vault", fetchall=False)[0]
-    
-    with c1:
-        st.metric(label="Total Cached Ingested Assets", value=f"{total_cached:,} Questions")
-    with c2:
-        st.metric(label="Fuzzy Cache Efficiency Rate", value="94.2 %")
-    with c3:
-        st.metric(label="Calculated SaaS Infrastructure Overhead Costs", value="₹0.00 / Mo")
+    num_questions = st.slider("Select number of questions for test generation:", min_value=1, max_value=25, value=5)
+    generate_btn = st.button("⚡ Generate Random Assessment", use_container_width=True)
 
-with tab4:
-    st.header("System Monetization Gateways")
-    p1, p2, p3, p4 = st.columns(4)
-    with p1:
-        st.code("📚 Free Tier\n- 5 Queries / Day\n- English Only\n\nPrice: ₹0")
-    with p2:
-        st.code("🎯 Basic Tier\n- Unlimited Banking/SSC\n- Bilingual Tabs\n\nPrice: ₹99/Mo")
-    with p3:
-        st.code("🔥 Pro Master Tier\n- Encompasses CA/CS, JEE\n- Diagram Rendering\n\nPrice: ₹299/Mo")
-    with p4:
-        st.code("🏫 Corporate Enterprise\n- Multitenant Dashboard\n- Complete School Access\n\nPrice: ₹2999/Mo")
+    if generate_btn:
+        st.session_state.current_test = run_query(
+            "SELECT question, solution_en, difficulty, source FROM academic_vault WHERE level = ? AND subject = ? ORDER BY RANDOM() LIMIT ?",
+            (selected_level, selected_subject, num_questions)
+        )
 
-with tab5:
-    st.header("User Security Profile Matrix")
-    st.text_input("Registered Administrator Email Identifier Address", value="founder@coreai.edu.in")
-    st.text_input("Active System Authorization Clearance Tier", value="SuperUser (DPIIT Verified Operational Mode)")
+    if "current_test" in st.session_state and st.session_state.current_test:
+        st.write("---")
+        st.success(f"Generated a {len(st.session_state.current_test)}-question test for **{selected_level} - {selected_subject}**!")
+        
+        for idx, (question, solution, difficulty, source) in enumerate(st.session_state.current_test):
+            st.markdown(f"### Question {idx+1}")
+            st.markdown(f"<span style='color:#38bdf8; font-weight:bold;'>[{difficulty.upper()}]</span> — Source: `{source}`", unsafe_allow_html=True)
+            st.markdown(f'<div class="question-box"><strong>{question}</strong></div>', unsafe_allow_html=True)
+            
+            with st.expander(f"🔑 View Answer Key for Question {idx+1}"):
+                st.markdown(f'<div class="explanation-box">{solution}</div>', unsafe_allow_html=True)
+            st.write("---")
+
