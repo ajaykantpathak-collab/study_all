@@ -9,13 +9,12 @@ import openai
 import anthropic
 
 # -----------------------------------------------------------------------------
-# 1. LOGGING SETUP
+# 1. LOGGING SETUP & CONSTANTS
 # -----------------------------------------------------------------------------
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
-# Constants
-MAX_CONTEXT_TURNS   = 10      # Max conversation turns sent to AI (context window guard)
+MAX_CONTEXT_TURNS   = 10      # Max conversation turns sent to AI
 MAX_TEXT_FILE_CHARS = 12_000  # Truncate large text files before sending
 MAX_FILE_MB         = 5       # Reject files larger than this
 
@@ -39,7 +38,7 @@ LANG = {
         "connecting":         "Connecting to Cloud Database...",
         "registering":        "Creating your account...",
         "login_failed":       "Login failed: invalid credentials or database unreachable.",
-        "register_success":   "✅ Account created successfully ! You can now login .",
+        "register_success":   "✅ Account created successfully! You can now login.",
         "register_failed":    "Registration failed: {e}",
         "forgot_password":    "Forgot Password? Reset via Email",
         "reset_sent":         "✅ Password reset email sent! Check your inbox.",
@@ -47,7 +46,7 @@ LANG = {
         "reset_email_label":  "Enter your registered email to reset password:",
         "send_reset":         "Send Reset Link",
         "back_to_login":      "← Back to Login",
-        "app_title":          "🧠 Intellect Engine (Multi-Node)",
+        "app_title":          "🧠 Intellect Engine (Multi-Node RAG)",
         "session":            "Secure Session",
         "logout":             "Logout",
         "diagram_expander":   "📊 View AI Routing Architecture (Mermaid)",
@@ -98,7 +97,7 @@ LANG = {
         "reset_email_label":  "अपना पंजीकृत ईमेल दर्ज करें:",
         "send_reset":         "रीसेट लिंक भेजें",
         "back_to_login":      "← लॉगिन पर वापस जाएं",
-        "app_title":          "🧠 बुद्धि इंजन (मल्टी-नोड)",
+        "app_title":          "🧠 बुद्धि इंजन (मल्टी-नोड RAG)",
         "session":            "सुरक्षित सत्र",
         "logout":             "लॉगआउट",
         "diagram_expander":   "📊 AI रूटिंग आर्किटेक्चर देखें (Mermaid)",
@@ -163,30 +162,57 @@ def authenticate_user(email: str, password: str, max_retries: int = 3):
                 time.sleep(2 ** attempt)
     raise last_exc
 
-
 def register_user(email: str, password: str):
-    """Creates a new Supabase Auth account."""
     return supabase_client.auth.sign_up({"email": email, "password": password})
-
 
 def reset_password(email: str):
     supabase_client.auth.reset_password_email(email)
 
 # -----------------------------------------------------------------------------
-# 5. DATABASE HELPERS
+# 5. DATABASE & RAG HELPERS
 # -----------------------------------------------------------------------------
+def check_cache(prompt: str) -> str | None:
+    clean_prompt = prompt.strip()
+    try:
+        db_check = supabase_client.table("ai_logs").select("ai_response").eq("prompt", clean_prompt).execute()
+        if db_check.data and len(db_check.data) > 0:
+            return db_check.data[0]["ai_response"]
+    except Exception as e:
+        logger.warning("Cache check failed: %s", e)
+    return None
+
+def fetch_rag_context(prompt: str) -> str:
+    clean_prompt = prompt.strip()
+    try:
+        embed_res = gemini_client.models.embed_content(
+            model='text-embedding-004',
+            contents=clean_prompt
+        )
+        query_vector = embed_res.embeddings[0].values
+        
+        docs = supabase_client.rpc("match_documents", {
+            "query_embedding": query_vector,
+            "match_threshold": 0.7, 
+            "match_count": 3
+        }).execute()
+        
+        if docs.data:
+            return "\n\n".join([doc["content"] for doc in docs.data])
+    except Exception as e:
+        logger.warning("RAG Retrieval failed: %s", e)
+    return ""
+
 def log_to_database(user_id: str, prompt: str, response: str, engine: str):
     try:
         supabase_client.table("ai_logs").insert({
             "user_id":     user_id,
-            "prompt":      prompt,
+            "prompt":      prompt.strip(),
             "ai_response": response,
             "engine_used": engine,
         }).execute()
     except Exception as exc:
         logger.warning("DB log failed: %s", exc)
         st.warning(t("db_warn", e=exc))
-
 
 def fetch_history(user_id: str, limit: int = 20) -> list[dict]:
     try:
@@ -203,26 +229,16 @@ def fetch_history(user_id: str, limit: int = 20) -> list[dict]:
         logger.warning("History fetch failed: %s", exc)
         return []
 
-
 def delete_all_history(user_id: str):
-    """Permanently deletes all AI logs for this user."""
     supabase_client.table("ai_logs").delete().eq("user_id", user_id).execute()
 
-
 def delete_single_log(log_id: str):
-    """Deletes one specific log entry by its UUID."""
     supabase_client.table("ai_logs").delete().eq("id", log_id).execute()
 
-# -----------------------------------------------------------------------------
+    # -----------------------------------------------------------------------------
 # 6. FILE PROCESSING
 # -----------------------------------------------------------------------------
 def extract_file_content(uploaded_file) -> tuple[str | None, str | None, str | None]:
-    """
-    Returns (content, mime_type, error_message).
-    - Text/CSV/JSON  → decoded UTF-8 string, truncated if needed, mime="text"
-    - PDF/image      → base64 string, mime = original MIME type
-    - Too large      → (None, None, error)
-    """
     size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
     if size_mb > MAX_FILE_MB:
         return None, None, t("file_too_large")
@@ -241,13 +257,9 @@ def extract_file_content(uploaded_file) -> tuple[str | None, str | None, str | N
     return b64, mime, None
 
 # -----------------------------------------------------------------------------
-# 7. CONTEXT WINDOW GUARD — trim history before sending to AI
+# 7. CONTEXT WINDOW GUARD
 # -----------------------------------------------------------------------------
 def safe_history(history: list[dict]) -> tuple[list[dict], bool]:
-    """
-    Returns (trimmed_history, was_trimmed).
-    Keeps only the last MAX_CONTEXT_TURNS turns to avoid context overflow.
-    """
     if len(history) > MAX_CONTEXT_TURNS:
         return history[-MAX_CONTEXT_TURNS:], True
     return history, False
@@ -255,24 +267,15 @@ def safe_history(history: list[dict]) -> tuple[list[dict], bool]:
 # -----------------------------------------------------------------------------
 # 8. MESSAGE BUILDERS
 # -----------------------------------------------------------------------------
-def build_openai_messages(
-    history: list[dict],
-    user_prompt: str,
-    file_content: str | None,
-    file_mime: str | None,
-) -> list[dict]:
-    messages = [{"role": "system", "content": "You are a helpful AI assistant."}]
+def build_openai_messages(history, user_prompt, file_content, file_mime, system_instruction):
+    messages = [{"role": "system", "content": system_instruction}]
     for turn in history:
         messages.append({"role": "user",      "content": turn["user"]})
         messages.append({"role": "assistant", "content": turn["assistant"]})
 
-    # Build current user content — OpenAI supports image_url for vision
     if file_content and file_mime and file_mime.startswith("image/"):
         content = [
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:{file_mime};base64,{file_content}"},
-            },
+            {"type": "image_url", "image_url": {"url": f"data:{file_mime};base64,{file_content}"}},
             {"type": "text", "text": user_prompt},
         ]
     elif file_content and file_mime == "text":
@@ -283,13 +286,7 @@ def build_openai_messages(
     messages.append({"role": "user", "content": content})
     return messages
 
-
-def build_anthropic_messages(
-    history: list[dict],
-    user_prompt: str,
-    file_content: str | None,
-    file_mime: str | None,
-) -> list[dict]:
+def build_anthropic_messages(history, user_prompt, file_content, file_mime):
     messages = []
     for turn in history:
         messages.append({"role": "user",      "content": turn["user"]})
@@ -298,10 +295,7 @@ def build_anthropic_messages(
     if file_content and file_mime and file_mime not in (None, "text"):
         block_type = "image" if file_mime.startswith("image/") else "document"
         content = [
-            {
-                "type": block_type,
-                "source": {"type": "base64", "media_type": file_mime, "data": file_content},
-            },
+            {"type": block_type, "source": {"type": "base64", "media_type": file_mime, "data": file_content}},
             {"type": "text", "text": user_prompt},
         ]
     elif file_content and file_mime == "text":
@@ -313,28 +307,32 @@ def build_anthropic_messages(
     return messages
 
 # -----------------------------------------------------------------------------
-# 9. TRIPLE-THREAT AI ROUTER — streaming + memory + file + context guard
+# 9. TRIPLE-THREAT AI ROUTER (With RAG + Diagram Instructions)
 # -----------------------------------------------------------------------------
-def stream_intelligence(
-    user_prompt: str,
-    file_content: str | None,
-    file_mime: str | None,
-    history: list[dict],
-    output_placeholder,
-) -> tuple[str, str]:
-    """
-    Streams response token-by-token. Falls back Gemini → Claude → OpenAI.
-    Returns (full_answer, provider_name).
-    """
+def stream_intelligence(user_prompt, file_content, file_mime, history, output_placeholder):
     trimmed_history, was_trimmed = safe_history(history)
     if was_trimmed:
         st.caption(t("context_trimmed"))
+
+    rag_context = fetch_rag_context(user_prompt)
+    
+    system_instruction = f"""
+    You are an expert engineering tutor. Answer the user's question clearly. 
+    Use the following contextual documents to inform your answer if they are relevant:
+    
+    CONTEXT:
+    {rag_context}
+    
+    CRITICAL INSTRUCTIONS:
+    1. Always include at least one concrete example.
+    2. If explaining a complex, structural, or visual concept, you MUST use Markdown tables or ASCII art to create a simple text-based diagram for the user.
+    """
 
     full_prompt_text = user_prompt
     if file_content and file_mime == "text":
         full_prompt_text = f"{user_prompt}\n\n--- Attached file ---\n{file_content}"
 
-    # ── ENGINE 1: GEMINI (streaming) ─────────────────────────────────────────
+    # ── ENGINE 1: GEMINI ─────────────────────────────────────────────────────
     for attempt in range(3):
         try:
             contents = []
@@ -355,7 +353,10 @@ def stream_intelligence(
             for chunk in gemini_client.models.generate_content_stream(
                 model="gemini-2.5-flash",
                 contents=contents,
-                config=genai_types.GenerateContentConfig(temperature=0.0),
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.0,
+                    system_instruction=system_instruction
+                ),
             ):
                 if chunk.text:
                     full_text += chunk.text
@@ -373,16 +374,15 @@ def stream_intelligence(
                 continue
             break
 
-    # ── ENGINE 2: CLAUDE (streaming) ─────────────────────────────────────────
+    # ── ENGINE 2: CLAUDE ─────────────────────────────────────────────────────
     try:
-        claude_messages = build_anthropic_messages(
-            trimmed_history, user_prompt, file_content, file_mime
-        )
+        claude_messages = build_anthropic_messages(trimmed_history, user_prompt, file_content, file_mime)
         full_text = ""
         with anthropic_client.messages.stream(
             model="claude-haiku-4-5-20251001",
             max_tokens=1000,
             temperature=0.0,
+            system=system_instruction,
             messages=claude_messages,
         ) as stream:
             for token in stream.text_stream:
@@ -391,18 +391,15 @@ def stream_intelligence(
 
         output_placeholder.markdown(full_text)
         return full_text, "Anthropic Claude"
-
     except Exception as exc:
         logger.warning("Claude stream failed: %s", exc)
 
-    # ── ENGINE 3: OPENAI (streaming + image vision) ──────────────────────────
+    # ── ENGINE 3: OPENAI ─────────────────────────────────────────────────────
     try:
-        oai_messages = build_openai_messages(
-            trimmed_history, user_prompt, file_content, file_mime
-        )
+        oai_messages = build_openai_messages(trimmed_history, user_prompt, file_content, file_mime, system_instruction)
         full_text = ""
         for chunk in openai_client.chat.completions.create(
-            model="gpt-4o-mini",   # gpt-4o-mini supports vision
+            model="gpt-4o-mini",
             messages=oai_messages,
             temperature=0.0,
             stream=True,
@@ -413,14 +410,13 @@ def stream_intelligence(
 
         output_placeholder.markdown(full_text)
         return full_text, "OpenAI GPT"
-
     except Exception as exc:
         logger.error("OpenAI stream failed: %s", exc)
 
     raise RuntimeError(t("all_failed"))
 
 # -----------------------------------------------------------------------------
-# 10. LANGUAGE SELECTOR — sidebar (always visible, even on login)
+# 10. LANGUAGE SELECTOR (Sidebar)
 # -----------------------------------------------------------------------------
 with st.sidebar:
     lang_choice = st.radio(
@@ -435,15 +431,14 @@ with st.sidebar:
         st.rerun()
 
 # -----------------------------------------------------------------------------
-# 11. AUTH UI — Login / Register / Reset Password
+# 11. AUTH UI 
 # -----------------------------------------------------------------------------
 def auth_ui():
     if "auth_view" not in st.session_state:
-        st.session_state.auth_view = "login"   # "login" | "register" | "reset"
+        st.session_state.auth_view = "login"   
 
     view = st.session_state.auth_view
 
-    # ── REGISTER ─────────────────────────────────────────────────────────────
     if view == "register":
         st.title(t("register_title"))
         email    = st.text_input(t("email"), key="reg_email")
@@ -469,7 +464,6 @@ def auth_ui():
             st.session_state.auth_view = "login"
             st.rerun()
 
-    # ── RESET PASSWORD ────────────────────────────────────────────────────────
     elif view == "reset":
         st.title("🔑 " + t("forgot_password"))
         reset_email = st.text_input(t("reset_email_label"))
@@ -488,7 +482,6 @@ def auth_ui():
             st.session_state.auth_view = "login"
             st.rerun()
 
-    # ── LOGIN ─────────────────────────────────────────────────────────────────
     else:
         st.title(t("login_title"))
         email    = st.text_input(t("email"), key="login_email")
@@ -517,8 +510,6 @@ def auth_ui():
                 st.session_state.auth_view = "reset"
                 st.rerun()
 
-
-# ── Enforce authentication gate ───────────────────────────────────────────────
 if "user" not in st.session_state:
     auth_ui()
     st.stop()
@@ -527,7 +518,7 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
 # -----------------------------------------------------------------------------
-# 12. SIDEBAR — settings + delete history + past conversations
+# 12. SIDEBAR HISTORY & SETTINGS
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.divider()
@@ -551,7 +542,6 @@ with st.sidebar:
     db_history = fetch_history(st.session_state.user.id, limit=20)
 
     if db_history:
-        # ── Delete ALL history ────────────────────────────────────────────────
         if st.button(t("delete_history"), type="secondary", use_container_width=True):
             st.session_state.confirm_delete_all = True
 
@@ -572,7 +562,6 @@ with st.sidebar:
                     st.session_state.confirm_delete_all = False
                     st.rerun()
 
-        # ── List past conversations with per-item delete ──────────────────────
         for item in db_history:
             ts = item["created_at"][:16].replace("T", " ")
             with st.expander(f"🕐 {ts} — {item['engine_used']}", expanded=False):
@@ -588,41 +577,36 @@ with st.sidebar:
         st.caption(t("no_history"))
 
 # -----------------------------------------------------------------------------
-# 13. MAIN APP
+# 13. MAIN APP EXECUTION
 # -----------------------------------------------------------------------------
 st.title(t("app_title"))
 
-# ── MERMAID ARCHITECTURE DIAGRAM ─────────────────────────────────────────────
 with st.expander(t("diagram_expander"), expanded=False):
     st.markdown("""
 ```mermaid
 flowchart TD
-    A([👤 User Query]) --> B[🚦 AI Traffic Router]
-    B --> C[⚡ Gemini 2.5 Flash\nPrimary — Free Tier]
-    C -->|429 / 503?| D{🔄 Retry Logic\nup to 3x}
-    D -->|retry| C
-    D -->|hard fail| E[🤖 Claude Haiku 4.5\nFailover 1]
-    C -->|✅ success| G([✅ Response to User])
-    E -->|✅ success| G
-    E -->|fails| F[🧠 GPT-4o-mini\nFailover 2 — Final Net]
-    F -->|✅ success| G
-    F -->|fails| H([❌ All Engines Failed])
-    G --> I[(🗄️ Supabase Cloud DB\nai_logs + RLS)]
+    A([👤 User Query]) --> B{🗄️ Check DB Cache}
+    B -->|Found Match| C([⚡ Instant Free Response])
+    B -->|No Match| D[🔍 RAG Vector Search]
+    D --> E[🚦 Triple-Threat AI Router]
+    E --> F[Gemini 2.5 Flash]
+    F -->|Fails| G[Claude Haiku 4.5]
+    G -->|Fails| H[GPT-4o-mini]
+    F -->|Success| I([✅ Response to User])
+    G -->|Success| I
+    H -->|Success| I
+    I --> J[(💾 Save to Supabase Cache)]
+    
     style A fill:#4A90D9,color:#fff
-    style B fill:#7B68EE,color:#fff
-    style C fill:#34A853,color:#fff
-    style D fill:#64748B,color:#fff
-    style E fill:#D97706,color:#fff
-    style F fill:#6366F1,color:#fff
-    style G fill:#4A90D9,color:#fff
-    style H fill:#DC2626,color:#fff
-    style I fill:#0F9D58,color:#fff
-```
-    """)
-
+    style B fill:#0F9D58,color:#fff
+    style C fill:#0F9D58,color:#fff
+    style D fill:#7B68EE,color:#fff
+    style E fill:#7B68EE,color:#fff
+    style I fill:#4A90D9,color:#fff
+    style J fill:#0F9D58,color:#fff
+                """)
 st.divider()
 
-# ── RENDER CURRENT SESSION CHAT ───────────────────────────────────────────────
 for turn in st.session_state.chat_history:
     with st.chat_message("user"):
         st.markdown(turn["user"])
@@ -632,22 +616,38 @@ for turn in st.session_state.chat_history:
         st.markdown(turn["assistant"])
         st.caption(f"— {turn['provider']}")
 
-# ── FILE UPLOAD ───────────────────────────────────────────────────────────────
 uploaded_file = st.file_uploader(
     t("upload_label"),
     type=["txt", "csv", "json", "pdf", "png", "jpg", "jpeg", "webp"],
     label_visibility="visible",
 )
 
-# ── CHAT INPUT ────────────────────────────────────────────────────────────────
 query = st.chat_input(t("query_label"))
 
 if query:
+    clean_query = f"[{uploaded_file.name}] {query}" if uploaded_file else query
+    
     with st.chat_message("user"):
         st.markdown(query)
         if uploaded_file:
             st.caption(t("file_note", name=uploaded_file.name))
 
+    # PHASE 1: CACHE
+    cached_answer = check_cache(clean_query)
+    if cached_answer:
+        with st.chat_message("assistant"):
+            st.markdown(cached_answer)
+            st.caption("— ⚡ Loaded from Cache (Free)")
+            
+        st.session_state.chat_history.append({
+            "user":      query,
+            "assistant": cached_answer,
+            "provider":  "Cache Hit",
+            "file_name": uploaded_file.name if uploaded_file else None,
+        })
+        st.stop()
+
+    # PHASE 2 & 3: RAG + GENERATION
     file_content, file_mime, file_error = None, None, None
     file_name = None
     if uploaded_file:
@@ -676,9 +676,10 @@ if query:
                 "file_name": file_name,
             })
 
+            # PHASE 4: SAVE CACHE
             log_to_database(
                 user_id=st.session_state.user.id,
-                prompt=f"[{file_name}] {query}" if file_name else query,
+                prompt=clean_query,
                 response=answer,
                 engine=provider,
             )
@@ -686,7 +687,6 @@ if query:
         except RuntimeError as err:
             st.error(str(err))
 
-# ── CLEAR SESSION CHAT ────────────────────────────────────────────────────────
 if st.session_state.chat_history:
     if st.button(t("clear_chat"), type="secondary"):
         st.session_state.chat_history = []
