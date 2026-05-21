@@ -10,6 +10,13 @@ from google.genai import types as genai_types
 import openai
 import anthropic
 
+st.set_page_config(
+    page_title="Intellect Engine",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
 from edtech_config import (
     SCHOOL_BOARDS,
     SCHOOL_CLASSES,
@@ -262,13 +269,13 @@ def get_secret(name: str) -> str:
 @st.cache_resource
 def init_clients():
     supabase_url = "https://pyeddkjbcfzfcajcqhnj.supabase.co"
-    supabase_key = get_secret("SUPABASE_KEY")
+    supabase_key = get_secret("SUPABASE_ANON_KEY") or get_secret("SUPABASE_KEY")
     gemini_key = get_secret("GEMINI_API_KEY")
     openai_key = get_secret("OPENAI_API_KEY")
     anthropic_key = get_secret("ANTHROPIC_API_KEY")
     missing = [
         name for name, value in {
-            "SUPABASE_KEY": supabase_key,
+            "SUPABASE_ANON_KEY or SUPABASE_KEY": supabase_key,
             "GEMINI_API_KEY": gemini_key,
             "OPENAI_API_KEY": openai_key,
             "ANTHROPIC_API_KEY": anthropic_key,
@@ -297,7 +304,7 @@ def authenticate_user(email: str, password: str, max_retries: int = 3):
     for attempt in range(max_retries):
         try:
             return supabase_client.auth.sign_in_with_password(
-                {"email": email, "password": password}
+                {"email": email.strip(), "password": password}
             )
         except Exception as exc:
             last_exc = exc
@@ -506,6 +513,289 @@ def render_mermaid_blocks(text: str):
                 st.code(part.strip(), language="mermaid")
         else:
             st.code(part.strip(), language="mermaid")
+
+def apply_premium_theme():
+    st.markdown(
+        """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+:root {
+    --bg: #0b1020;
+    --panel: rgba(15, 23, 42, 0.72);
+    --panel-strong: rgba(15, 23, 42, 0.92);
+    --stroke: rgba(148, 163, 184, 0.22);
+    --text: #e5e7eb;
+    --muted: #94a3b8;
+    --brand: #8b5cf6;
+    --brand-2: #06b6d4;
+    --gold: #fbbf24;
+}
+
+html, body, [class*="css"] {
+    font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+.stApp {
+    color: var(--text);
+    background:
+        radial-gradient(circle at top left, rgba(139, 92, 246, 0.32), transparent 34rem),
+        radial-gradient(circle at top right, rgba(6, 182, 212, 0.22), transparent 32rem),
+        linear-gradient(135deg, #020617 0%, #0f172a 48%, #111827 100%);
+}
+
+[data-testid="stHeader"] {
+    background: rgba(2, 6, 23, 0.08);
+}
+
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, rgba(15, 23, 42, 0.98), rgba(2, 6, 23, 0.98));
+    border-right: 1px solid var(--stroke);
+}
+
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"],
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] p {
+    color: var(--text);
+}
+
+.block-container {
+    max-width: 1220px;
+    padding-top: 2rem;
+    padding-bottom: 4rem;
+}
+
+.premium-hero {
+    position: relative;
+    overflow: hidden;
+    padding: 2.2rem;
+    margin-bottom: 1.4rem;
+    border: 1px solid var(--stroke);
+    border-radius: 28px;
+    background:
+        linear-gradient(135deg, rgba(139, 92, 246, 0.22), rgba(6, 182, 212, 0.12)),
+        rgba(15, 23, 42, 0.72);
+    box-shadow: 0 30px 80px rgba(2, 6, 23, 0.36);
+    backdrop-filter: blur(18px);
+}
+
+.premium-hero:after {
+    content: "";
+    position: absolute;
+    width: 240px;
+    height: 240px;
+    right: -70px;
+    top: -90px;
+    border-radius: 999px;
+    background: radial-gradient(circle, rgba(251, 191, 36, 0.28), transparent 68%);
+}
+
+.premium-kicker {
+    display: inline-flex;
+    align-items: center;
+    gap: .45rem;
+    padding: .42rem .78rem;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 999px;
+    color: #cffafe;
+    background: rgba(6, 182, 212, 0.12);
+    font-size: .82rem;
+    font-weight: 700;
+    letter-spacing: .02em;
+    text-transform: uppercase;
+}
+
+.premium-hero h1 {
+    margin: .85rem 0 .45rem 0;
+    color: #f8fafc;
+    font-size: clamp(2.2rem, 5vw, 4.6rem);
+    line-height: .95;
+    letter-spacing: -0.075em;
+}
+
+.premium-hero p {
+    max-width: 760px;
+    color: #cbd5e1;
+    font-size: 1.08rem;
+    line-height: 1.7;
+}
+
+.premium-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 1rem;
+    margin: 1.1rem 0 1.4rem 0;
+}
+
+.premium-card, .auth-card {
+    border: 1px solid var(--stroke);
+    border-radius: 24px;
+    background: var(--panel);
+    box-shadow: 0 20px 55px rgba(2, 6, 23, 0.26);
+    backdrop-filter: blur(16px);
+}
+
+.premium-card {
+    padding: 1rem;
+}
+
+.premium-card b {
+    color: #f8fafc;
+}
+
+.premium-card span {
+    display: block;
+    margin-top: .35rem;
+    color: var(--muted);
+    font-size: .9rem;
+}
+
+.auth-shell {
+    min-height: 78vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.auth-card {
+    width: min(100%, 460px);
+    padding: 2rem;
+    margin: 1.5rem auto;
+}
+
+.auth-card h1 {
+    margin: 0 0 .4rem 0;
+    color: #f8fafc;
+    letter-spacing: -0.05em;
+}
+
+.auth-card p {
+    color: var(--muted);
+}
+
+.profile-pill {
+    display: inline-flex;
+    padding: .65rem .9rem;
+    border: 1px solid rgba(139, 92, 246, 0.32);
+    border-radius: 999px;
+    background: rgba(139, 92, 246, 0.16);
+    color: #ede9fe;
+    font-weight: 700;
+}
+
+.sidebar-brand {
+    padding: 1rem;
+    margin: .2rem 0 1rem 0;
+    border: 1px solid var(--stroke);
+    border-radius: 22px;
+    background: linear-gradient(135deg, rgba(139, 92, 246, 0.2), rgba(6, 182, 212, 0.12));
+}
+
+.sidebar-brand h2 {
+    margin: 0;
+    color: #f8fafc;
+    font-size: 1.25rem;
+    letter-spacing: -0.04em;
+}
+
+.sidebar-brand p {
+    margin: .35rem 0 0 0;
+    color: var(--muted);
+    font-size: .86rem;
+}
+
+[data-testid="stMetric"] {
+    padding: 1rem;
+    border: 1px solid var(--stroke);
+    border-radius: 20px;
+    background: rgba(15, 23, 42, 0.62);
+    box-shadow: 0 16px 40px rgba(2, 6, 23, 0.18);
+}
+
+[data-testid="stChatMessage"] {
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    border-radius: 22px;
+    background: rgba(15, 23, 42, 0.58);
+    box-shadow: 0 16px 46px rgba(2, 6, 23, 0.16);
+}
+
+.stButton > button, .stDownloadButton > button {
+    border-radius: 999px;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    font-weight: 700;
+}
+
+.stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, var(--brand), var(--brand-2));
+    border: 0;
+    color: white;
+    box-shadow: 0 14px 32px rgba(6, 182, 212, 0.24);
+}
+
+.stTextInput input, .stSelectbox div[data-baseweb="select"], .stTextArea textarea {
+    border-radius: 16px;
+}
+
+[data-testid="stFileUploader"] {
+    padding: 1rem;
+    border: 1px dashed rgba(148, 163, 184, 0.32);
+    border-radius: 22px;
+    background: rgba(15, 23, 42, 0.46);
+}
+
+.stTabs [data-baseweb="tab-list"] {
+    gap: .5rem;
+}
+
+.stTabs [data-baseweb="tab"] {
+    border-radius: 999px;
+    padding: .65rem 1.05rem;
+    background: rgba(15, 23, 42, 0.7);
+}
+
+@media (max-width: 760px) {
+    .premium-grid {
+        grid-template-columns: 1fr;
+    }
+    .premium-hero {
+        padding: 1.3rem;
+    }
+}
+</style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def render_sidebar_brand():
+    st.markdown(
+        """
+<div class="sidebar-brand">
+    <h2>📚 Intellect Engine</h2>
+    <p>Premium AI tutor with syllabus guardrails, RAG, and learning analytics.</p>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def render_hero(profile: dict):
+    st.markdown(
+        f"""
+<div class="premium-hero">
+    <div class="premium-kicker">⚡ AI Tutor · RAG Vault · Secure Learning</div>
+    <h1>Intellect Engine</h1>
+    <p>A premium syllabus-aligned tutor for Indian students. Ask doubts, attach files, retrieve verified vault answers, and track learning progress.</p>
+    <div class="profile-pill">🎯 {profile["display_label"]}</div>
+</div>
+<div class="premium-grid">
+    <div class="premium-card"><b>📚 Verified Vault</b><span>Retrieves strong matches from your question bank before using AI.</span></div>
+    <div class="premium-card"><b>🧭 Syllabus Guardrails</b><span>Answers stay aligned to class, exam, subject, and chapter profile.</span></div>
+    <div class="premium-card"><b>📊 Learning Insights</b><span>Dashboard tracks activity for parents and teachers.</span></div>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+apply_premium_theme()
 
 
 # -----------------------------------------------------------------------------
@@ -750,6 +1040,7 @@ def render_curriculum_sidebar():
 # 12. LANGUAGE SELECTOR (Sidebar)
 # -----------------------------------------------------------------------------
 with st.sidebar:
+    render_sidebar_brand()
     lang_choice = st.radio(
         t("language_label"),
         options=["en", "hi"],
@@ -770,8 +1061,19 @@ def auth_ui():
 
     view = st.session_state.auth_view
 
+    st.markdown(
+        """
+<div class="auth-card">
+    <div class="premium-kicker">Secure AI Learning Workspace</div>
+    <h1>Intellect Engine</h1>
+    <p>Login to access your premium syllabus-aligned tutor, semantic vault, and learning analytics.</p>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     if view == "register":
-        st.title(t("register_title"))
+        st.subheader(t("register_title"))
         email    = st.text_input(t("email"), key="reg_email")
         password = st.text_input(t("password"), type="password", key="reg_pass")
         confirm  = st.text_input(t("confirm_password"), type="password", key="reg_confirm")
@@ -796,7 +1098,7 @@ def auth_ui():
             st.rerun()
 
     elif view == "reset":
-        st.title("🔑 " + t("forgot_password"))
+        st.subheader("🔑 " + t("forgot_password"))
         reset_email = st.text_input(t("reset_email_label"))
 
         if st.button(t("send_reset"), type="primary"):
@@ -814,7 +1116,7 @@ def auth_ui():
             st.rerun()
 
     else:
-        st.title(t("login_title"))
+        st.subheader(t("login_title"))
         email    = st.text_input(t("email"), key="login_email")
         password = st.text_input(t("password"), type="password", key="login_pass")
 
@@ -828,8 +1130,11 @@ def auth_ui():
                         st.session_state.user         = res.user
                         st.session_state.chat_history = []
                         st.rerun()
-                    except Exception:
+                    except Exception as exc:
+                        logger.exception("Login failed")
                         st.error(t("login_failed"))
+                        with st.expander("Technical details"):
+                            st.code(str(exc))
 
         col1, col2 = st.columns(2)
         with col1:
@@ -852,7 +1157,6 @@ if "chat_history" not in st.session_state:
 # 14. SIDEBAR HISTORY & SETTINGS
 # -----------------------------------------------------------------------------
 with st.sidebar:
-    st.divider()
     active_profile = render_curriculum_sidebar()
     st.divider()
     st.subheader(t("sidebar_settings"))
@@ -923,9 +1227,8 @@ with tab_dashboard:
     )
 
 with tab_chat:
-    st.title(t("app_title"))
     profile_banner = get_student_profile()
-    st.caption(f"🎯 {profile_banner['display_label']}")
+    render_hero(profile_banner)
     if profile_banner.get("hindi_only"):
         st.caption("🇮🇳 " + t("hindi_mode_header"))
 

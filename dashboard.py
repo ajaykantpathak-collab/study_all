@@ -107,8 +107,16 @@ def build_stats(logs: list[dict]) -> dict:
 
 
 def render_dashboard(supabase, user_id: str, user_email: str, t):
-    st.header(t("dashboard_title"))
-    st.caption(t("dashboard_subtitle", email=user_email))
+    st.markdown(
+        f"""
+<div class="premium-hero">
+    <div class="premium-kicker">Learning Analytics</div>
+    <h1>{t("dashboard_title")}</h1>
+    <p>{t("dashboard_subtitle", email=user_email)}</p>
+</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     logs = fetch_dashboard_logs(supabase, user_id)
     if not logs:
