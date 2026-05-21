@@ -137,7 +137,7 @@ def t(key: str, **kwargs) -> str:
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def init_clients():
-    supabase_url = "https://pyeddkjbcfzcajcqhnj.supabase.co"
+    supabase_url = "https://pyeddkjbcfzfcajcqhnj.supabase.co"
     supabase = create_client(supabase_url, st.secrets["SUPABASE_KEY"])
     gemini   = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
     oai      = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
