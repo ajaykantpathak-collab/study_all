@@ -41,3 +41,9 @@ _pycache_/
 # Ignore OS files
 .DS_Store
 Thumbs.db
+
+.streamlit/secrets.toml
+
+# Ignore large database exports
+*.csv
+*.db

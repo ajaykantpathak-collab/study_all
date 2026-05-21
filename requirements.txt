@@ -3,7 +3,6 @@ google-genai
 pandas
 matplotlib
 numpy
-datasets
 tqdm
 razorpay
 pillow
@@ -11,3 +10,6 @@ pypdf
 pdf2image
 pdfplumber
 streamlit-mermaid
+supabase==2.7.4
+openai
+anthropic

@@ -1,456 +1,692 @@
-import os
-import sqlite3
-import pandas as pd
-import time
-import hashlib
-import logging
-from datetime import datetime
-from contextlib import contextmanager
 import streamlit as st
-from streamlit_mermaid import st_mermaid
+import time
+import logging
+import base64
+from supabase import create_client
+from google import genai
+from google.genai import types as genai_types
+import openai
+import anthropic
 
-# ==========================================
-# 0. SYSTEM CONFIGURATION & SECURITY BOOT
-# ==========================================
+# -----------------------------------------------------------------------------
+# 1. LOGGING SETUP
+# -----------------------------------------------------------------------------
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger("CoreAIEngine")
+# Constants
+MAX_CONTEXT_TURNS   = 10      # Max conversation turns sent to AI (context window guard)
+MAX_TEXT_FILE_CHARS = 12_000  # Truncate large text files before sending
+MAX_FILE_MB         = 5       # Reject files larger than this
 
-DB_NAME = "coreai_vault.db"
+# -----------------------------------------------------------------------------
+# 2. LANGUAGE STRINGS (English + Hindi)
+# -----------------------------------------------------------------------------
+LANG = {
+    "en": {
+        "login_title":        "🔐 Secure System Login",
+        "register_title":     "📝 Create Account",
+        "email":              "Email",
+        "password":           "Password",
+        "confirm_password":   "Confirm Password",
+        "password_mismatch":  "Passwords do not match.",
+        "password_short":     "Password must be at least 6 characters.",
+        "login_btn":          "Login",
+        "register_btn":       "Create Account",
+        "go_register":        "Don't have an account? Sign up",
+        "go_login":           "Already have an account? Login",
+        "fill_both":          "Please enter both email and password.",
+        "connecting":         "Connecting to Cloud Database...",
+        "registering":        "Creating your account...",
+        "login_failed":       "Login failed: invalid credentials or database unreachable.",
+        "register_success":   "✅ Account created! Please check your email to verify, then login.",
+        "register_failed":    "Registration failed: {e}",
+        "forgot_password":    "Forgot Password? Reset via Email",
+        "reset_sent":         "✅ Password reset email sent! Check your inbox.",
+        "reset_failed":       "Reset failed: email not found or error occurred.",
+        "reset_email_label":  "Enter your registered email to reset password:",
+        "send_reset":         "Send Reset Link",
+        "back_to_login":      "← Back to Login",
+        "app_title":          "🧠 Intellect Engine (Multi-Node)",
+        "session":            "Secure Session",
+        "logout":             "Logout",
+        "diagram_expander":   "📊 View AI Routing Architecture (Mermaid)",
+        "no_history":         "No past conversations found.",
+        "delete_history":     "🗑️ Delete All History",
+        "delete_confirm":     "Are you sure? This cannot be undone.",
+        "delete_done":        "✅ All history deleted.",
+        "delete_failed":      "Delete failed: {e}",
+        "upload_label":       "📎 Attach file (PDF, image, or text — max 5 MB):",
+        "file_too_large":     "File too large. Maximum size is 5 MB.",
+        "file_truncated":     "File truncated to {n} chars to fit context window.",
+        "query_label":        "Enter your query…",
+        "routing":            "Routing request through AI cluster...",
+        "success":            "Response via **{provider}** — saved to Cloud.",
+        "db_warn":            "Response generated, but failed to save to cloud history: {e}",
+        "all_failed":         "CRITICAL: All three AI engines failed. Please try again in a few moments.",
+        "language_label":     "🌐 Language / भाषा",
+        "clear_chat":         "🗑️ Clear Chat",
+        "you":                "You",
+        "assistant":          "Assistant",
+        "file_note":          "📄 File attached: {name}",
+        "new_chat":           "➕ New Chat",
+        "sidebar_history":    "💬 Past Conversations",
+        "sidebar_settings":   "⚙️ Settings",
+        "context_trimmed":    "ℹ️ Older messages trimmed to stay within context limits.",
+    },
+    "hi": {
+        "login_title":        "🔐 सुरक्षित सिस्टम लॉगिन",
+        "register_title":     "📝 खाता बनाएं",
+        "email":              "ईमेल",
+        "password":           "पासवर्ड",
+        "confirm_password":   "पासवर्ड की पुष्टि करें",
+        "password_mismatch":  "पासवर्ड मेल नहीं खाते।",
+        "password_short":     "पासवर्ड कम से कम 6 अक्षर का होना चाहिए।",
+        "login_btn":          "लॉगिन करें",
+        "register_btn":       "खाता बनाएं",
+        "go_register":        "खाता नहीं है? साइन अप करें",
+        "go_login":           "पहले से खाता है? लॉगिन करें",
+        "fill_both":          "कृपया ईमेल और पासवर्ड दोनों दर्ज करें।",
+        "connecting":         "क्लाउड डेटाबेस से जोड़ा जा रहा है...",
+        "registering":        "आपका खाता बनाया जा रहा है...",
+        "login_failed":       "लॉगिन विफल: गलत क्रेडेंशियल या डेटाबेस अनुपलब्ध।",
+        "register_success":   "✅ खाता बनाया गया! कृपया अपना ईमेल सत्यापित करें, फिर लॉगिन करें।",
+        "register_failed":    "पंजीकरण विफल: {e}",
+        "forgot_password":    "पासवर्ड भूल गए? ईमेल से रीसेट करें",
+        "reset_sent":         "✅ पासवर्ड रीसेट ईमेल भेजा गया!",
+        "reset_failed":       "रीसेट विफल।",
+        "reset_email_label":  "अपना पंजीकृत ईमेल दर्ज करें:",
+        "send_reset":         "रीसेट लिंक भेजें",
+        "back_to_login":      "← लॉगिन पर वापस जाएं",
+        "app_title":          "🧠 बुद्धि इंजन (मल्टी-नोड)",
+        "session":            "सुरक्षित सत्र",
+        "logout":             "लॉगआउट",
+        "diagram_expander":   "📊 AI रूटिंग आर्किटेक्चर देखें (Mermaid)",
+        "no_history":         "कोई पिछली बातचीत नहीं मिली।",
+        "delete_history":     "🗑️ सारा इतिहास मिटाएं",
+        "delete_confirm":     "क्या आप निश्चित हैं? यह पूर्ववत नहीं किया जा सकता।",
+        "delete_done":        "✅ सारा इतिहास मिटा दिया गया।",
+        "delete_failed":      "मिटाना विफल: {e}",
+        "upload_label":       "📎 फ़ाइल संलग्न करें (PDF, इमेज, या टेक्स्ट — अधिकतम 5 MB):",
+        "file_too_large":     "फ़ाइल बहुत बड़ी है। अधिकतम आकार 5 MB है।",
+        "file_truncated":     "फ़ाइल को {n} अक्षरों तक छोटा किया गया।",
+        "query_label":        "अपना प्रश्न दर्ज करें…",
+        "routing":            "AI क्लस्टर के माध्यम से अनुरोध रूट किया जा रहा है...",
+        "success":            "**{provider}** के माध्यम से उत्तर — क्लाउड में सहेजा गया।",
+        "db_warn":            "उत्तर तैयार हुआ, लेकिन क्लाउड हिस्ट्री में सहेजना विफल: {e}",
+        "all_failed":         "गंभीर त्रुटि: तीनों AI इंजन विफल हो गए।",
+        "language_label":     "🌐 Language / भाषा",
+        "clear_chat":         "🗑️ चैट साफ़ करें",
+        "you":                "आप",
+        "assistant":          "सहायक",
+        "file_note":          "📄 फ़ाइल संलग्न: {name}",
+        "new_chat":           "➕ नई चैट",
+        "sidebar_history":    "💬 पिछली बातचीत",
+        "sidebar_settings":   "⚙️ सेटिंग्स",
+        "context_trimmed":    "ℹ️ संदर्भ सीमा के लिए पुराने संदेश हटाए गए।",
+    },
+}
 
-# Force environment sync for GenAI SDK compatibility on Streamlit Cloud
-if "GEMINI_API_KEY" in st.secrets:
-    os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
+def t(key: str, **kwargs) -> str:
+    lang = st.session_state.get("lang", "en")
+    text = LANG[lang].get(key, LANG["en"].get(key, key))
+    return text.format(**kwargs) if kwargs else text
 
-@contextmanager
-def get_db_connection():
-    """Yields a thread-isolated SQLite connection and guarantees absolute closure."""
-    conn = sqlite3.connect(DB_NAME, timeout=60.0)
-    conn.execute("PRAGMA synchronous=NORMAL;") 
-    try:
-        yield conn
-    finally:
-        conn.close()
+# -----------------------------------------------------------------------------
+# 3. INFRASTRUCTURE & CREDENTIALS
+# -----------------------------------------------------------------------------
+@st.cache_resource
+def init_clients():
+    supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+    gemini   = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
+    oai      = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+    claude   = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+    return supabase, gemini, oai, claude
 
-def run_schema_migration_safely():
-    """Compiles tables safely without assuming legacy constraint structures."""
-    try:
-        conn = sqlite3.connect(DB_NAME, timeout=60.0)
-        conn.execute("PRAGMA journal_mode=WAL;") 
-        
-        with conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS academic_vault (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    board TEXT,
-                    level TEXT,
-                    subject TEXT,
-                    question TEXT,
-                    solution_hi TEXT,
-                    solution_en TEXT,
-                    difficulty TEXT,
-                    question_type TEXT,
-                    source TEXT
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS app_users (
-                    username TEXT PRIMARY KEY,
-                    password_hash TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS analytics_ledger (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT,
-                    subject TEXT,
-                    stream_level TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-        conn.close()
-        logger.info("Database schemas verified and initialized safely.")
-    except Exception as e:
-        logger.error(f"Security schema system init failure: {e}")
-        raise e
+supabase_client, gemini_client, openai_client, anthropic_client = init_clients()
 
-@st.cache_resource(show_spinner="Provisioning core engine assets...")
-def global_system_provisioning():
-    """Runs strictly ONCE per deployment to unpack assets and verify SDKs."""
-    try:
-        from db_helper import verify_and_unpack_database
-        verify_and_unpack_database()
-    except Exception:
-        pass
-    
-    try:
-        run_schema_migration_safely()
-    except Exception as e:
-        st.error(f"Database Initialization Failed: {e}")
-        st.stop()
-        
-    try:
-        from google import genai
-        from PIL import Image
-    except ImportError:
-        st.error("Missing libraries. Ensure google-genai and pillow are in requirements.txt.")
-        st.stop()
-        
-    return True
-
-global_system_provisioning()
-
-# ───────────────────────────────────────────────────────────────
-# ⚙️ DATA TRANSACTION LAYER
-# ───────────────────────────────────────────────────────────────
-
-def run_write_transaction(query, params=(), max_retries=5) -> bool:
-    """Safe concurrency writer with linear backoff for locked databases."""
+# -----------------------------------------------------------------------------
+# 4. AUTH HELPERS
+# -----------------------------------------------------------------------------
+def authenticate_user(email: str, password: str, max_retries: int = 3):
+    last_exc = None
     for attempt in range(max_retries):
         try:
-            with get_db_connection() as conn:
-                with conn:  
-                    cursor = conn.cursor()
-                    cursor.execute(query, params)
-                return True
-        except sqlite3.OperationalError as e:
-            if "locked" in str(e).lower() and attempt < max_retries - 1:
-                time.sleep(0.1 * (attempt + 1))  
-                continue
-            return False
-        except Exception:
-            return False
-    return False
-
-def hash_password(password: str) -> str:
-    salt = "CoreAI_Secure_Salt_2026_#"  
-    return hashlib.sha256((password + salt).encode()).hexdigest()
-
-def register_user_identity(username, password) -> bool:
-    return run_write_transaction("INSERT INTO app_users (username, password_hash) VALUES (?, ?)", (username, hash_password(password)))
-
-def authenticate_user_identity(username, password) -> bool:
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT password_hash FROM app_users WHERE username = ?", (username,))
-            row = cursor.fetchone()
-            return row and row[0] == hash_password(password)
-    except Exception:
-        return False
-
-def log_analytics_event(username, subject, level):
-    run_write_transaction(
-        "INSERT INTO analytics_ledger (username, subject, stream_level) VALUES (?, ?, ?)",
-        (username, subject, level)
-    )
-
-# ───────────────────────────────────────────────────────────────
-# 🧠 AUTO-INGESTING MULTIMODAL RAG ENGINE
-# ───────────────────────────────────────────────────────────────
-
-def retrieve_rag_context(student_query: str, subject: str, limit=2) -> str:
-    if not student_query:
-        return "No textual context markers provided."
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT question, solution_en FROM academic_vault WHERE subject = ? AND solution_en IS NOT NULL LIMIT 50", (subject,))
-            records = cursor.fetchall()
-            
-            context_segments = []
-            keywords = [kw.lower() for kw in student_query.split() if len(kw) > 3]
-            for q_text, sol_text in records:
-                if any(kw in q_text.lower() for kw in keywords):
-                    context_segments.append(f"Reference Question: {q_text}\nVerified Solution: {sol_text}")
-                    if len(context_segments) >= limit: break
-            return "\n\n---\n\n".join(context_segments) if context_segments else "No direct reference matches found."
-    except Exception:
-        return "No direct reference matches found."
-
-def commit_new_question_to_vault(level, subject, raw_question, parsed_en, parsed_hi) -> bool:
-    """Safely checks for existing data before committing to avoid schema crashes."""
-    clean_q = raw_question.strip()
-    if not clean_q or len(clean_q) < 5:
-        return False
-        
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT id FROM academic_vault WHERE question = ?", (clean_q,))
-            if cursor.fetchone():
-                return True 
-            
-            cursor.execute("""
-                INSERT INTO academic_vault (board, level, subject, question, solution_en, solution_hi, difficulty, question_type, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, ("CBSE/State", level, subject, clean_q, parsed_en, parsed_hi, "Medium", "Conceptual", "Organic_Student_Ingestion"))
-            conn.commit()
-            return True
-    except Exception as e:
-        logger.error(f"Failed to auto-ingest question: {e}")
-        return False
-
-def generate_multimodal_rag_response(student_query: str, level: str, subject: str, uploaded_file) -> dict:
-    try:
-        from google import genai
-        from google.genai import types
-        from PIL import Image as PILImage
-        import io
-
-        client = genai.Client()
-        local_context = retrieve_rag_context(student_query, subject)
-        
-        engineered_prompt = f"""
-        You are an elite academic tutor. Analyze the problem input query.
-        Provide your final response structured EXACTLY within these parameters:
-        
-        [CLEAN_QUESTION_TEXT]
-        Extract and rewrite a clean, standardized, single-line text version of the question being asked. Do not include answers here.
-        
-        [CONCEPT_DIAGRAM]
-        Draft a high-level description of the concept and STRICTLY include a Mermaid graph architecture block wrapped in ```mermaid tags.
-        
-        [ENGLISH_SOLUTION]
-        Provide a complete step-by-step mathematical or conceptual resolution in English.
-        
-        [HINDI_SOLUTION]
-        हिंदी में पूरा कदम-दर-कदम समाधान प्रदान करें।
-
-        VERIFIED DATABASE CONTEXT FOR GROUNDING:
-        {local_context}
-
-        STUDENT DIRECTIONS:
-        {student_query if student_query else "Process the attached file."}
-        """
-
-        contents = []
-        if uploaded_file is not None:
-            file_bytes = uploaded_file.read()
-            if uploaded_file.type.startswith("image/"):
-                contents.append(PILImage.open(io.BytesIO(file_bytes)))
-            elif uploaded_file.type == "application/pdf":
-                contents.append(types.Part.from_bytes(data=file_bytes, mime_type="application/pdf"))
-        
-        contents.append(engineered_prompt)
-        response = client.models.generate_content(model='gemini-2.5-flash', contents=contents)
-        raw_text = response.text if response.text else ""
-        
-        extracted_q = student_query if student_query else "Image Question Entry"
-        sol_en, sol_hi, concept = "Generation failed.", "समाधान विफल।", "No schematic map."
-        
-        try:
-            if "[CLEAN_QUESTION_TEXT]" in raw_text:
-                parts = raw_text.split("[CLEAN_QUESTION_TEXT]")[1].split("[CONCEPT_DIAGRAM]")
-                extracted_q = parts[0].strip()
-                sub_parts = parts[1].split("[ENGLISH_SOLUTION]")
-                concept = sub_parts[0].strip()
-                final_parts = sub_parts[1].split("[HINDI_SOLUTION]")
-                sol_en = final_parts[0].strip()
-                sol_hi = final_parts[1].strip()
-        except Exception:
-            sol_en = raw_text
-        
-        commit_new_question_to_vault(level, subject, extracted_q, sol_en, sol_hi)
-        return {"concept": concept, "en": sol_en, "hi": sol_hi}
-    except Exception as e:
-        return {"concept": f"Pipeline Error: {e}", "en": "System encountered an anomaly.", "hi": "त्रुटि"}
-
-# ───────────────────────────────────────────────────────────────
-# 📈 TAXONOMY & EXAM PAPER MAKER LAYER
-# ───────────────────────────────────────────────────────────────
-
-def get_live_system_metrics():
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM academic_vault")
-            return cursor.fetchone()[0]
-    except Exception: 
-        return 0
-
-def fetch_mock_exam_paper(level, subject, limit=10):
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT question FROM academic_vault WHERE level = ? AND subject = ? AND question NOT LIKE 'Image Question%' ORDER BY RANDOM() LIMIT ?",
-                (level, subject, limit)
+            return supabase_client.auth.sign_in_with_password(
+                {"email": email, "password": password}
             )
-            return [row[0] for row in cursor.fetchall()]
-    except Exception:
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("Login attempt %d failed: %s", attempt + 1, exc)
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+    raise last_exc
+
+
+def register_user(email: str, password: str):
+    """Creates a new Supabase Auth account."""
+    return supabase_client.auth.sign_up({"email": email, "password": password})
+
+
+def reset_password(email: str):
+    supabase_client.auth.reset_password_email(email)
+
+# -----------------------------------------------------------------------------
+# 5. DATABASE HELPERS
+# -----------------------------------------------------------------------------
+def log_to_database(user_id: str, prompt: str, response: str, engine: str):
+    try:
+        supabase_client.table("ai_logs").insert({
+            "user_id":     user_id,
+            "prompt":      prompt,
+            "ai_response": response,
+            "engine_used": engine,
+        }).execute()
+    except Exception as exc:
+        logger.warning("DB log failed: %s", exc)
+        st.warning(t("db_warn", e=exc))
+
+
+def fetch_history(user_id: str, limit: int = 20) -> list[dict]:
+    try:
+        result = (
+            supabase_client.table("ai_logs")
+            .select("id, prompt, ai_response, engine_used, created_at")
+            .eq("user_id", user_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return result.data or []
+    except Exception as exc:
+        logger.warning("History fetch failed: %s", exc)
         return []
 
-def get_comprehensive_taxonomy():
-    primary_subjects = ["Mathematics", "Environmental Studies (EVS)", "English", "Hindi", "General Knowledge"]
-    middle_subjects = ["Mathematics", "Science", "Social Science", "English", "Hindi", "Sanskrit"]
-    secondary_subjects = ["Mathematics", "Science", "Social Science", "English", "Hindi", "Computer Applications"]
-    senior_science = ["Physics", "Chemistry", "Mathematics", "Biology", "English", "Computer Science"]
-    senior_commerce = ["Accountancy", "Business Studies", "Economics", "Mathematics", "English"]
-    senior_humanities = ["History", "Political Science", "Geography", "Economics", "Psychology", "English"]
-    
-    return {
-        "Class 1": primary_subjects, "Class 2": primary_subjects, "Class 3": primary_subjects,
-        "Class 4": primary_subjects, "Class 5": primary_subjects, "Class 6": middle_subjects,
-        "Class 7": middle_subjects, "Class 8": middle_subjects, "Class 9": secondary_subjects,
-        "Class 10": secondary_subjects, 
-        "Class 11 (Science)": senior_science, "Class 11 (Commerce)": senior_commerce, "Class 11 (Humanities)": senior_humanities,
-        "Class 12 (Science)": senior_science, "Class 12 (Commerce)": senior_commerce, "Class 12 (Humanities)": senior_humanities,
-        "JEE Main": ["Mathematics", "Physics", "Chemistry"],
-        "JEE Advanced": ["Mathematics", "Physics", "Chemistry"],
-        "NEET Core": ["Physics", "Chemistry", "Biology"],
-        "CUET (UG)": ["Domain Subjects", "Languages", "General Test"]
-    }
 
-STRUCTURED_MAP = get_comprehensive_taxonomy()
-SYSTEM_LEVELS = list(STRUCTURED_MAP.keys())
+def delete_all_history(user_id: str):
+    """Permanently deletes all AI logs for this user."""
+    supabase_client.table("ai_logs").delete().eq("user_id", user_id).execute()
 
-# ==========================================
-# 2. STREAMLIT VISUAL PRESENCE USER INTERFACE
-# ==========================================
 
-st.set_page_config(page_title="CoreAI Intellect Engine", page_icon="🧠", layout="wide")
+def delete_single_log(log_id: str):
+    """Deletes one specific log entry by its UUID."""
+    supabase_client.table("ai_logs").delete().eq("id", log_id).execute()
 
-if "authenticated" not in st.session_state: st.session_state.authenticated = False
-if "current_user" not in st.session_state: st.session_state.current_user = None
-if "payload_dict" not in st.session_state: st.session_state.payload_dict = None
+# -----------------------------------------------------------------------------
+# 6. FILE PROCESSING
+# -----------------------------------------------------------------------------
+def extract_file_content(uploaded_file) -> tuple[str | None, str | None, str | None]:
+    """
+    Returns (content, mime_type, error_message).
+    - Text/CSV/JSON  → decoded UTF-8 string, truncated if needed, mime="text"
+    - PDF/image      → base64 string, mime = original MIME type
+    - Too large      → (None, None, error)
+    """
+    size_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
+    if size_mb > MAX_FILE_MB:
+        return None, None, t("file_too_large")
 
+    mime = uploaded_file.type
+    raw  = uploaded_file.read()
+
+    if mime in ("text/plain", "text/csv", "application/json"):
+        text = raw.decode("utf-8", errors="replace")
+        if len(text) > MAX_TEXT_FILE_CHARS:
+            st.info(t("file_truncated", n=MAX_TEXT_FILE_CHARS))
+            text = text[:MAX_TEXT_FILE_CHARS]
+        return text, "text", None
+
+    b64 = base64.b64encode(raw).decode("utf-8")
+    return b64, mime, None
+
+# -----------------------------------------------------------------------------
+# 7. CONTEXT WINDOW GUARD — trim history before sending to AI
+# -----------------------------------------------------------------------------
+def safe_history(history: list[dict]) -> tuple[list[dict], bool]:
+    """
+    Returns (trimmed_history, was_trimmed).
+    Keeps only the last MAX_CONTEXT_TURNS turns to avoid context overflow.
+    """
+    if len(history) > MAX_CONTEXT_TURNS:
+        return history[-MAX_CONTEXT_TURNS:], True
+    return history, False
+
+# -----------------------------------------------------------------------------
+# 8. MESSAGE BUILDERS
+# -----------------------------------------------------------------------------
+def build_openai_messages(
+    history: list[dict],
+    user_prompt: str,
+    file_content: str | None,
+    file_mime: str | None,
+) -> list[dict]:
+    messages = [{"role": "system", "content": "You are a helpful AI assistant."}]
+    for turn in history:
+        messages.append({"role": "user",      "content": turn["user"]})
+        messages.append({"role": "assistant", "content": turn["assistant"]})
+
+    # Build current user content — OpenAI supports image_url for vision
+    if file_content and file_mime and file_mime.startswith("image/"):
+        content = [
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:{file_mime};base64,{file_content}"},
+            },
+            {"type": "text", "text": user_prompt},
+        ]
+    elif file_content and file_mime == "text":
+        content = f"{user_prompt}\n\n--- Attached file ---\n{file_content}"
+    else:
+        content = user_prompt
+
+    messages.append({"role": "user", "content": content})
+    return messages
+
+
+def build_anthropic_messages(
+    history: list[dict],
+    user_prompt: str,
+    file_content: str | None,
+    file_mime: str | None,
+) -> list[dict]:
+    messages = []
+    for turn in history:
+        messages.append({"role": "user",      "content": turn["user"]})
+        messages.append({"role": "assistant", "content": turn["assistant"]})
+
+    if file_content and file_mime and file_mime not in (None, "text"):
+        block_type = "image" if file_mime.startswith("image/") else "document"
+        content = [
+            {
+                "type": block_type,
+                "source": {"type": "base64", "media_type": file_mime, "data": file_content},
+            },
+            {"type": "text", "text": user_prompt},
+        ]
+    elif file_content and file_mime == "text":
+        content = f"{user_prompt}\n\n--- Attached file ---\n{file_content}"
+    else:
+        content = user_prompt
+
+    messages.append({"role": "user", "content": content})
+    return messages
+
+# -----------------------------------------------------------------------------
+# 9. TRIPLE-THREAT AI ROUTER — streaming + memory + file + context guard
+# -----------------------------------------------------------------------------
+def stream_intelligence(
+    user_prompt: str,
+    file_content: str | None,
+    file_mime: str | None,
+    history: list[dict],
+    output_placeholder,
+) -> tuple[str, str]:
+    """
+    Streams response token-by-token. Falls back Gemini → Claude → OpenAI.
+    Returns (full_answer, provider_name).
+    """
+    trimmed_history, was_trimmed = safe_history(history)
+    if was_trimmed:
+        st.caption(t("context_trimmed"))
+
+    full_prompt_text = user_prompt
+    if file_content and file_mime == "text":
+        full_prompt_text = f"{user_prompt}\n\n--- Attached file ---\n{file_content}"
+
+    # ── ENGINE 1: GEMINI (streaming) ─────────────────────────────────────────
+    for attempt in range(3):
+        try:
+            contents = []
+            for turn in trimmed_history:
+                contents.append({"role": "user",  "parts": [{"text": turn["user"]}]})
+                contents.append({"role": "model", "parts": [{"text": turn["assistant"]}]})
+
+            if file_content and file_mime and file_mime not in (None, "text"):
+                current_parts = [
+                    {"inline_data": {"mime_type": file_mime, "data": file_content}},
+                    {"text": user_prompt},
+                ]
+            else:
+                current_parts = [{"text": full_prompt_text}]
+            contents.append({"role": "user", "parts": current_parts})
+
+            full_text = ""
+            for chunk in gemini_client.models.generate_content_stream(
+                model="gemini-2.5-flash",
+                contents=contents,
+                config=genai_types.GenerateContentConfig(temperature=0.0),
+            ):
+                if chunk.text:
+                    full_text += chunk.text
+                    output_placeholder.markdown(full_text + "▌")
+
+            output_placeholder.markdown(full_text)
+            return full_text, "Google Gemini"
+
+        except Exception as exc:
+            err = str(exc).lower()
+            is_retryable = any(c in err for c in ("429", "503", "quota", "overloaded"))
+            logger.warning("Gemini attempt %d: %s", attempt + 1, exc)
+            if is_retryable and attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            break
+
+    # ── ENGINE 2: CLAUDE (streaming) ─────────────────────────────────────────
+    try:
+        claude_messages = build_anthropic_messages(
+            trimmed_history, user_prompt, file_content, file_mime
+        )
+        full_text = ""
+        with anthropic_client.messages.stream(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1000,
+            temperature=0.0,
+            messages=claude_messages,
+        ) as stream:
+            for token in stream.text_stream:
+                full_text += token
+                output_placeholder.markdown(full_text + "▌")
+
+        output_placeholder.markdown(full_text)
+        return full_text, "Anthropic Claude"
+
+    except Exception as exc:
+        logger.warning("Claude stream failed: %s", exc)
+
+    # ── ENGINE 3: OPENAI (streaming + image vision) ──────────────────────────
+    try:
+        oai_messages = build_openai_messages(
+            trimmed_history, user_prompt, file_content, file_mime
+        )
+        full_text = ""
+        for chunk in openai_client.chat.completions.create(
+            model="gpt-4o-mini",   # gpt-4o-mini supports vision
+            messages=oai_messages,
+            temperature=0.0,
+            stream=True,
+        ):
+            delta = chunk.choices[0].delta.content or ""
+            full_text += delta
+            output_placeholder.markdown(full_text + "▌")
+
+        output_placeholder.markdown(full_text)
+        return full_text, "OpenAI GPT"
+
+    except Exception as exc:
+        logger.error("OpenAI stream failed: %s", exc)
+
+    raise RuntimeError(t("all_failed"))
+
+# -----------------------------------------------------------------------------
+# 10. LANGUAGE SELECTOR — sidebar (always visible, even on login)
+# -----------------------------------------------------------------------------
 with st.sidebar:
-    st.title("🧠 CoreAI Engine")
-    st.markdown("---")
-    if st.session_state.authenticated:
-        st.success(f"Active User: **{st.session_state.current_user}**")
-        st.info("🔄 Data Flywheel Online")
-        if st.button("Log Out of App"):
-            st.session_state.authenticated = False
-            st.session_state.current_user = None
-            st.session_state.payload_dict = None
+    lang_choice = st.radio(
+        t("language_label"),
+        options=["en", "hi"],
+        format_func=lambda x: "English" if x == "en" else "हिन्दी",
+        index=0 if st.session_state.get("lang", "en") == "en" else 1,
+        horizontal=True,
+    )
+    if lang_choice != st.session_state.get("lang", "en"):
+        st.session_state.lang = lang_choice
+        st.rerun()
+
+# -----------------------------------------------------------------------------
+# 11. AUTH UI — Login / Register / Reset Password
+# -----------------------------------------------------------------------------
+def auth_ui():
+    if "auth_view" not in st.session_state:
+        st.session_state.auth_view = "login"   # "login" | "register" | "reset"
+
+    view = st.session_state.auth_view
+
+    # ── REGISTER ─────────────────────────────────────────────────────────────
+    if view == "register":
+        st.title(t("register_title"))
+        email    = st.text_input(t("email"), key="reg_email")
+        password = st.text_input(t("password"), type="password", key="reg_pass")
+        confirm  = st.text_input(t("confirm_password"), type="password", key="reg_confirm")
+
+        if st.button(t("register_btn"), type="primary"):
+            if not email or not password:
+                st.warning(t("fill_both"))
+            elif password != confirm:
+                st.warning(t("password_mismatch"))
+            elif len(password) < 6:
+                st.warning(t("password_short"))
+            else:
+                with st.spinner(t("registering")):
+                    try:
+                        register_user(email, password)
+                        st.success(t("register_success"))
+                    except Exception as exc:
+                        st.error(t("register_failed", e=exc))
+
+        if st.button(t("go_login")):
+            st.session_state.auth_view = "login"
             st.rerun()
 
-if not st.session_state.authenticated:
-    st.header("Institutional Identity Validation Gateway")
-    tab_login, tab_register = st.tabs(["🔒 Secure Login", "✍️ Register Profile"])
-    with tab_login:
-        with st.form("auth_login_form"):
-            user_input = st.text_input("Username").strip()
-            pass_input = st.text_input("Password", type="password")
-            if st.form_submit_button("Validate Credentials"):
-                if authenticate_user_identity(user_input, pass_input):
-                    st.session_state.authenticated = True
-                    st.session_state.current_user = user_input
-                    st.rerun()
-                else: st.error("Invalid details.")
-                    
-    with tab_register:
-        with st.form("auth_register_form"):
-            reg_user = st.text_input("Create Username").strip()
-            reg_pass = st.text_input("Create Password", type="password")
-            if st.form_submit_button("Register Account"):
-                if len(reg_user) < 4 or len(reg_pass) < 6: st.error("Username/Password too short.")
-                elif register_user_identity(reg_user, reg_pass): st.success("Created successfully!")
-                else: st.error("Registration failed. User may exist.")
-else:
-    total_q = get_live_system_metrics()
-    
-    portal_tab, practice_tab, analytics_tab = st.tabs(["🎯 Study Resolution Portal", "📋 Practice Test Maker", "📊 Diagnostic Analytics"])
-    
-    # ─── TAB 1: CORE STUDY PORTAL ───
-    with portal_tab:
-        st.title("🧠 CoreAI Multimodal RAG Engine")
-        st.caption("Snap a photo of your notebook problem or upload an assignment sheet directly.")
-        st.metric(label="Total Decentralized Vault Assets", value=f"{total_q:,} Questions")
-        st.markdown("---")
-        
-        col_sel1, col_sel2 = st.columns(2)
-        with col_sel1: selected_level = st.selectbox("Select Grade / Target Class Stream", SYSTEM_LEVELS, key="portal_lvl")
-        with col_sel2: selected_subject = st.selectbox("Select Academic Subject Module", STRUCTURED_MAP.get(selected_level, ["Science"]), key="portal_subj")
-            
-        uploaded_file = st.file_uploader("Upload notebook screenshot or problem file (PNG, JPG, PDF):", type=["png", "jpg", "jpeg", "pdf"])
-        input_query_text = st.text_area(label="Add notes or custom text queries manually:", placeholder="Type special instructions here...", height=100)
-        
-        if st.button("Compute Grounded Multimodal Engine", type="primary", use_container_width=True):
-            if not input_query_text.strip() and uploaded_file is None:
-                st.error("Please add a text question or upload an image file.")
-            else:
-                with st.spinner("Processing visual analysis and auto-ingesting to database..."):
-                    log_analytics_event(st.session_state.current_user, selected_subject, selected_level)
-                    st.session_state.payload_dict = generate_multimodal_rag_response(input_query_text.strip(), selected_level, selected_subject, uploaded_file)
-                    st.rerun()
+    # ── RESET PASSWORD ────────────────────────────────────────────────────────
+    elif view == "reset":
+        st.title("🔑 " + t("forgot_password"))
+        reset_email = st.text_input(t("reset_email_label"))
 
-        if st.session_state.payload_dict:
-            st.markdown("---")
-            st.success("✨ Resolution processed and successfully injected into your permanent repository vault!")
-            tab_en, tab_hi, tab_diagram = st.tabs(["🇬🇧 English Explanation", "🇮🇳 हिंदी समाधान", "🎯 Concept Map & Layout"])
-            
-            with tab_en: 
-                st.markdown(st.session_state.payload_dict.get("en", ""))
-            
-            with tab_hi: 
-                st.markdown(st.session_state.payload_dict.get("hi", ""))
-            
-            with tab_diagram: 
-                concept_data = st.session_state.payload_dict.get("concept", "")
-                
-                # SAFE RENDERING BLOCK: Checks for Mermaid syntax and renders graphics cleanly
-                if "```mermaid" in concept_data:
+        if st.button(t("send_reset"), type="primary"):
+            if not reset_email:
+                st.warning(t("fill_both"))
+            else:
+                try:
+                    reset_password(reset_email)
+                    st.success(t("reset_sent"))
+                except Exception:
+                    st.error(t("reset_failed"))
+
+        if st.button(t("back_to_login")):
+            st.session_state.auth_view = "login"
+            st.rerun()
+
+    # ── LOGIN ─────────────────────────────────────────────────────────────────
+    else:
+        st.title(t("login_title"))
+        email    = st.text_input(t("email"), key="login_email")
+        password = st.text_input(t("password"), type="password", key="login_pass")
+
+        if st.button(t("login_btn"), type="primary"):
+            if not email or not password:
+                st.warning(t("fill_both"))
+            else:
+                with st.spinner(t("connecting")):
                     try:
-                        # Extract the text before the diagram (if the AI included an explanation)
-                        text_before = concept_data.split("```mermaid")[0].strip()
-                        if text_before:
-                            st.markdown(text_before)
-                            
-                        # Isolate and render the mermaid diagram
-                        mermaid_code = concept_data.split("```mermaid")[1].split("```")[0].strip()
-                        st_mermaid(mermaid_code, height="500px")
+                        res = authenticate_user(email, password)
+                        st.session_state.user         = res.user
+                        st.session_state.chat_history = []
+                        st.rerun()
                     except Exception:
-                        st.markdown(concept_data) # Fallback to raw text if parsing fails
-                else:
-                    st.markdown(concept_data) # Fallback for standard ASCII text charts
+                        st.error(t("login_failed"))
 
-    # ─── TAB 2: INSTANT TEST PAPER GENERATOR ───
-    with practice_tab:
-        st.title("📋 Automated Mock Test Generator")
-        st.caption("Compiles an instant, custom testing matrix using curated database rows.")
-        
-        col_p1, col_p2, col_p3 = st.columns(3)
-        with col_p1: p_level = st.selectbox("Select Target Stream", SYSTEM_LEVELS, key="prac_lvl")
-        with col_p2: p_subject = st.selectbox("Select Target Subject", STRUCTURED_MAP.get(p_level, ["Science"]), key="prac_subj")
-        with col_p3: q_count = st.slider("Total Questions on Sheet", 5, 20, 10)
-        
-        if st.button("Generate Custom Practice Test Paper", use_container_width=True, type="primary"):
-            with st.spinner("Compiling test sheet indices..."):
-                questions = fetch_mock_exam_paper(p_level, p_subject, q_count)
-                if not questions:
-                    st.warning("No questions found in database yet. Go run a query in the Study Portal tab to auto-grow your list!")
-                else:
-                    st.markdown("---")
-                    st.subheader(f"📝 Practice Test Sheet: {p_level} - {p_subject}")
-                    
-                    for idx, q_string in enumerate(questions, 1):
-                        st.markdown(f"**Question {idx}:** {q_string}")
-                        st.text_area("Write solution here:", key=f"ans_box_{idx}", height=70)
-                        st.markdown("---")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button(t("go_register")):
+                st.session_state.auth_view = "register"
+                st.rerun()
+        with col2:
+            if st.button(t("forgot_password")):
+                st.session_state.auth_view = "reset"
+                st.rerun()
 
-    # ─── TAB 3: VISUAL METRICS ANALYTICS ───
-    with analytics_tab:
-        st.title("📊 Diagnostic Focus Area Analytics")
-        
+
+# ── Enforce authentication gate ───────────────────────────────────────────────
+if "user" not in st.session_state:
+    auth_ui()
+    st.stop()
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+# -----------------------------------------------------------------------------
+# 12. SIDEBAR — settings + delete history + past conversations
+# -----------------------------------------------------------------------------
+with st.sidebar:
+    st.divider()
+    st.subheader(t("sidebar_settings"))
+    st.caption(f"{t('session')}: {st.session_state.user.email}")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button(t("new_chat"), use_container_width=True):
+            st.session_state.chat_history = []
+            st.rerun()
+    with col2:
+        if st.button(t("logout"), use_container_width=True, type="secondary"):
+            del st.session_state.user
+            st.session_state.chat_history = []
+            st.rerun()
+
+    st.divider()
+    st.subheader(t("sidebar_history"))
+
+    db_history = fetch_history(st.session_state.user.id, limit=20)
+
+    if db_history:
+        # ── Delete ALL history ────────────────────────────────────────────────
+        if st.button(t("delete_history"), type="secondary", use_container_width=True):
+            st.session_state.confirm_delete_all = True
+
+        if st.session_state.get("confirm_delete_all"):
+            st.warning(t("delete_confirm"))
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("✅ Yes", use_container_width=True):
+                    try:
+                        delete_all_history(st.session_state.user.id)
+                        st.session_state.confirm_delete_all = False
+                        st.success(t("delete_done"))
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(t("delete_failed", e=exc))
+            with c2:
+                if st.button("❌ No", use_container_width=True):
+                    st.session_state.confirm_delete_all = False
+                    st.rerun()
+
+        # ── List past conversations with per-item delete ──────────────────────
+        for item in db_history:
+            ts = item["created_at"][:16].replace("T", " ")
+            with st.expander(f"🕐 {ts} — {item['engine_used']}", expanded=False):
+                st.markdown(f"**{t('you')}:** {item['prompt']}")
+                st.markdown(f"**{t('assistant')}:** {item['ai_response']}")
+                if st.button("🗑️ Delete", key=f"del_{item['id']}"):
+                    try:
+                        delete_single_log(item["id"])
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(t("delete_failed", e=exc))
+    else:
+        st.caption(t("no_history"))
+
+# -----------------------------------------------------------------------------
+# 13. MAIN APP
+# -----------------------------------------------------------------------------
+st.title(t("app_title"))
+
+# ── MERMAID ARCHITECTURE DIAGRAM ─────────────────────────────────────────────
+with st.expander(t("diagram_expander"), expanded=False):
+    st.markdown("""
+```mermaid
+flowchart TD
+    A([👤 User Query]) --> B[🚦 AI Traffic Router]
+    B --> C[⚡ Gemini 2.5 Flash\nPrimary — Free Tier]
+    C -->|429 / 503?| D{🔄 Retry Logic\nup to 3x}
+    D -->|retry| C
+    D -->|hard fail| E[🤖 Claude Haiku 4.5\nFailover 1]
+    C -->|✅ success| G([✅ Response to User])
+    E -->|✅ success| G
+    E -->|fails| F[🧠 GPT-4o-mini\nFailover 2 — Final Net]
+    F -->|✅ success| G
+    F -->|fails| H([❌ All Engines Failed])
+    G --> I[(🗄️ Supabase Cloud DB\nai_logs + RLS)]
+    style A fill:#4A90D9,color:#fff
+    style B fill:#7B68EE,color:#fff
+    style C fill:#34A853,color:#fff
+    style D fill:#64748B,color:#fff
+    style E fill:#D97706,color:#fff
+    style F fill:#6366F1,color:#fff
+    style G fill:#4A90D9,color:#fff
+    style H fill:#DC2626,color:#fff
+    style I fill:#0F9D58,color:#fff
+```
+    """)
+
+st.divider()
+
+# ── RENDER CURRENT SESSION CHAT ───────────────────────────────────────────────
+for turn in st.session_state.chat_history:
+    with st.chat_message("user"):
+        st.markdown(turn["user"])
+        if turn.get("file_name"):
+            st.caption(t("file_note", name=turn["file_name"]))
+    with st.chat_message("assistant"):
+        st.markdown(turn["assistant"])
+        st.caption(f"— {turn['provider']}")
+
+# ── FILE UPLOAD ───────────────────────────────────────────────────────────────
+uploaded_file = st.file_uploader(
+    t("upload_label"),
+    type=["txt", "csv", "json", "pdf", "png", "jpg", "jpeg", "webp"],
+    label_visibility="visible",
+)
+
+# ── CHAT INPUT ────────────────────────────────────────────────────────────────
+query = st.chat_input(t("query_label"))
+
+if query:
+    with st.chat_message("user"):
+        st.markdown(query)
+        if uploaded_file:
+            st.caption(t("file_note", name=uploaded_file.name))
+
+    file_content, file_mime, file_error = None, None, None
+    file_name = None
+    if uploaded_file:
+        file_content, file_mime, file_error = extract_file_content(uploaded_file)
+        if file_error:
+            st.error(file_error)
+            st.stop()
+        file_name = uploaded_file.name
+
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
         try:
-            with get_db_connection() as conn:
-                df_logs = pd.read_sql_query(
-                    "SELECT subject, COUNT(*) as queries FROM analytics_ledger WHERE username = ? GROUP BY subject ORDER BY queries DESC", 
-                    conn, params=(st.session_state.current_user,)
-                )
-            if df_logs.empty:
-                st.info("No logs compiled yet. Complete a few study portal questions to generate your charts!")
-            else:
-                col_chart, col_report = st.columns([2, 1])
-                with col_chart:
-                    st.bar_chart(data=df_logs, x="subject", y="queries", color="#FF4B4B")
-                with col_report:
-                    top_subject = df_logs.iloc[0]["subject"]
-                    st.write(f"Your primary study module focus is concentrated heavily on **{top_subject}**.")
-        except Exception:
-            st.info("Analytics engine ready. Complete a question query to compute your tracking charts.")
+            answer, provider = stream_intelligence(
+                user_prompt=query,
+                file_content=file_content,
+                file_mime=file_mime,
+                history=st.session_state.chat_history,
+                output_placeholder=placeholder,
+            )
+            st.caption(f"— {provider}")
+
+            st.session_state.chat_history.append({
+                "user":      query,
+                "assistant": answer,
+                "provider":  provider,
+                "file_name": file_name,
+            })
+
+            log_to_database(
+                user_id=st.session_state.user.id,
+                prompt=f"[{file_name}] {query}" if file_name else query,
+                response=answer,
+                engine=provider,
+            )
+
+        except RuntimeError as err:
+            st.error(str(err))
+
+# ── CLEAR SESSION CHAT ────────────────────────────────────────────────────────
+if st.session_state.chat_history:
+    if st.button(t("clear_chat"), type="secondary"):
+        st.session_state.chat_history = []
+        st.rerun()
