@@ -39,7 +39,7 @@ LANG = {
         "connecting":         "Connecting to Cloud Database...",
         "registering":        "Creating your account...",
         "login_failed":       "Login failed: invalid credentials or database unreachable.",
-        "register_success":   "✅ Account created! Please check your email to verify, then login.",
+        "register_success":   "✅ Account created successfully ! You can now login .",
         "register_failed":    "Registration failed: {e}",
         "forgot_password":    "Forgot Password? Reset via Email",
         "reset_sent":         "✅ Password reset email sent! Check your inbox.",
@@ -463,7 +463,7 @@ def auth_ui():
                         register_user(email, password)
                         st.success(t("register_success"))
                     except Exception as exc:
-                        st.exception(exc)
+                        st.error(t("register_failed", e=exc))
 
         if st.button(t("go_login")):
             st.session_state.auth_view = "login"
