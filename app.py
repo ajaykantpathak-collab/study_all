@@ -24,7 +24,7 @@ MAX_FILE_MB         = 5       # Reject files larger than this
 # -----------------------------------------------------------------------------
 LANG = {
     "en": {
-        "login_title":        "🔐 Secure System Login",
+        "login_title":        "🔐 v2Secure System Login",
         "register_title":     "📝 Create Account",
         "email":              "Email",
         "password":           "Password",
@@ -137,7 +137,8 @@ def t(key: str, **kwargs) -> str:
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def init_clients():
-    supabase = create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
+    supabase_url = "https://pyeddkjbcfzcajcqhnj.supabase.co"
+    supabase = create_client(supabase_url, st.secrets["SUPABASE_KEY"])
     gemini   = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
     oai      = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
     claude   = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
