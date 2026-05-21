@@ -62,7 +62,7 @@ MAX_OUTPUT_TOKENS   = 4096
 # -----------------------------------------------------------------------------
 LANG = {
     "en": {
-        "login_title":        "🔐 v2Secure System Login",
+        "login_title":        "🔐 Secure Login",
         "register_title":     "📝 Create Account",
         "email":              "Email",
         "password":           "Password",
@@ -155,7 +155,7 @@ LANG = {
         "context_trimmed":    "ℹ️ Older messages trimmed to stay within context limits.",
     },
     "hi": {
-        "login_title":        "🔐 सुरक्षित सिस्टम लॉगिन",
+        "login_title":        "🔐 सुरक्षित लॉगिन",
         "register_title":     "📝 खाता बनाएं",
         "email":              "ईमेल",
         "password":           "पासवर्ड",
@@ -979,15 +979,24 @@ def render_curriculum_sidebar():
     init_curriculum_defaults()
     st.subheader(t("curriculum_header"))
 
-    mode = st.radio(
+    mode = st.segmented_control(
         t("learning_mode"),
         LEARNING_MODES,
-        index=LEARNING_MODES.index(st.session_state.learning_mode),
+        default=st.session_state.learning_mode,
         key="learning_mode_radio",
     )
-    st.session_state.learning_mode = mode
+    st.session_state.learning_mode = mode or st.session_state.learning_mode
 
-    if mode == LEARNING_MODES[0]:
+    if st.session_state.learning_mode == LEARNING_MODES[0]:
+        st.markdown(
+            """
+<div class="premium-card">
+    <b>🏫 School Learning</b>
+    <span>Choose your board, class, and subject to keep answers syllabus-aligned.</span>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
         st.selectbox(t("board_label"), SCHOOL_BOARDS, key="school_board")
         st.selectbox(t("class_label"), SCHOOL_CLASSES, key="school_class")
         if int(st.session_state.school_class) >= 11:
@@ -1004,6 +1013,15 @@ def render_curriculum_sidebar():
         else:
             st.caption(t("chapter_na") if not subject else t("chapter_hint"))
     else:
+        st.markdown(
+            """
+<div class="premium-card">
+    <b>🏆 Competitive Exams</b>
+    <span>Select your exam and target subject for focused preparation.</span>
+</div>
+            """,
+            unsafe_allow_html=True,
+        )
         st.selectbox(
             t("exam_label"),
             list(COMPETITIVE_EXAMS.keys()),
@@ -1232,33 +1250,6 @@ with tab_chat:
     if profile_banner.get("hindi_only"):
         st.caption("🇮🇳 " + t("hindi_mode_header"))
 
-    with st.expander(t("diagram_expander"), expanded=False):
-        st.markdown("""
-```mermaid
-flowchart TD
-    A([👤 Student Query + Profile]) --> B{🗄️ Exact Cache?}
-    B -->|Hit| C([⚡ Cached Answer])
-    B -->|Miss| V{📚 Semantic Vault Q→A?}
-    V -->|Strong match| W([✅ Answer from your database])
-    V -->|No match| D[🔍 RAG + AI APIs]
-    D --> E[📋 Syllabus Guardrails Prompt]
-    E --> F[🚦 AI Router]
-    F --> G[Gemini 2.5 Flash]
-    G -->|Fail| H[Claude Haiku]
-    H -->|Fail| I[GPT-4o-mini]
-    G --> J([✅ Level-Matched Answer + Mermaid])
-    H --> J
-    I --> J
-    J --> K[(💾 Supabase ai_logs)]
-
-    style A fill:#4A90D9,color:#fff
-    style D fill:#7B68EE,color:#fff
-    style E fill:#E67E22,color:#fff
-    style J fill:#4A90D9,color:#fff
-    style K fill:#0F9D58,color:#fff
-                """)
-    st.divider()
-
     for turn in st.session_state.chat_history:
         with st.chat_message("user"):
             st.markdown(turn["user"])
@@ -1298,6 +1289,13 @@ flowchart TD
                 "provider":  "Cache Hit",
                 "file_name": uploaded_file.name if uploaded_file else None,
             })
+            log_to_database(
+                user_id=st.session_state.user.id,
+                prompt=clean_query,
+                response=cached_answer,
+                engine="Cache Hit",
+                profile=profile,
+            )
             st.stop()
 
         # PHASE 2: Semantic Q→A from vault (rephrased questions OK; skips API if strong match)

@@ -23,6 +23,7 @@ VAULT_HIT_THRESHOLD = 0.82
 # Fuzzy text match on local SQLite (different scale)
 LOCAL_HIT_THRESHOLD = 0.72
 LOCAL_CANDIDATE_LIMIT = 2500
+LOCAL_TOKEN_CANDIDATE_LIMIT = 6000
 
 
 @dataclass
@@ -231,6 +232,28 @@ def _local_filter_sql(profile: dict) -> tuple[str, list]:
     return sql, params
 
 
+def _local_token_filter_sql(query: str, profile: dict) -> tuple[str, list]:
+    base_sql, params = _local_filter_sql(profile)
+    terms = [
+        token for token in re.findall(r"[A-Za-z0-9]+", query.lower())
+        if len(token) >= 4
+    ][:6]
+    if not terms:
+        return base_sql, params
+
+    where_start = base_sql.index("WHERE ") + len("WHERE ")
+    where_end = base_sql.index(f"\n        LIMIT {LOCAL_CANDIDATE_LIMIT}")
+    where = base_sql[where_start:where_end].strip()
+    token_clause = " OR ".join(["LOWER(question) LIKE ?"] * len(terms))
+    sql = f"""
+        SELECT id, question, solution_en, solution_hi, diagram_code
+        FROM academic_vault
+        WHERE ({where}) AND ({token_clause})
+        LIMIT {LOCAL_TOKEN_CANDIDATE_LIMIT}
+    """
+    return sql, params + [f"%{term}%" for term in terms]
+
+
 def lookup_local_fuzzy(query: str, profile: dict, db_path: str = LOCAL_DB) -> VaultMatch | None:
     """Fallback when vector RPC fails — fuzzy match on local SQLite questions."""
     if not os.path.exists(db_path):
@@ -243,8 +266,11 @@ def lookup_local_fuzzy(query: str, profile: dict, db_path: str = LOCAL_DB) -> Va
     try:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
-        sql, params = _local_filter_sql(profile)
+        sql, params = _local_token_filter_sql(query, profile)
         rows = conn.execute(sql, params).fetchall()
+        if not rows:
+            sql, params = _local_filter_sql(profile)
+            rows = conn.execute(sql, params).fetchall()
         conn.close()
     except Exception as exc:
         logger.warning("Local vault query failed: %s", exc)
