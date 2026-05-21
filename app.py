@@ -463,7 +463,7 @@ def auth_ui():
                         register_user(email, password)
                         st.success(t("register_success"))
                     except Exception as exc:
-                        st.error(t("register_failed", e=exc))
+                        st.exception(exc)
 
         if st.button(t("go_login")):
             st.session_state.auth_view = "login"
