@@ -1,12 +1,42 @@
+import re
 import streamlit as st
 import time
 import logging
 import base64
+import os
 from supabase import create_client
 from google import genai
 from google.genai import types as genai_types
 import openai
 import anthropic
+
+from edtech_config import (
+    SCHOOL_BOARDS,
+    SCHOOL_CLASSES,
+    STREAMS_11_12,
+    COMPETITIVE_EXAMS,
+    LEARNING_MODES,
+    DEFAULT_HINDI_ONLY_SUBJECTS,
+    subjects_for_school,
+    pedagogy_profile,
+    build_system_instruction,
+    build_rag_query,
+    filter_rag_docs,
+    cache_key,
+)
+from ncert_data import (
+    CHAPTER_ANY,
+    ncert_chapters_for,
+    chapter_available,
+)
+from dashboard import render_dashboard
+from vault_lookup import lookup_vault_answer
+from db_helper import verify_and_unpack_database
+
+try:
+    import streamlit_mermaid as stmd
+except ImportError:
+    stmd = None
 
 # -----------------------------------------------------------------------------
 # 1. LOGGING SETUP & CONSTANTS
@@ -17,6 +47,8 @@ logger = logging.getLogger(__name__)
 MAX_CONTEXT_TURNS   = 10      # Max conversation turns sent to AI
 MAX_TEXT_FILE_CHARS = 12_000  # Truncate large text files before sending
 MAX_FILE_MB         = 5       # Reject files larger than this
+EMBED_MODEL         = "gemini-embedding-001"  # 768 dims — must match ingest_vault.py
+MAX_OUTPUT_TOKENS   = 4096
 
 # -----------------------------------------------------------------------------
 # 2. LANGUAGE STRINGS (English + Hindi)
@@ -46,7 +78,49 @@ LANG = {
         "reset_email_label":  "Enter your registered email to reset password:",
         "send_reset":         "Send Reset Link",
         "back_to_login":      "← Back to Login",
-        "app_title":          "🧠 Intellect Engine (Multi-Node RAG)",
+        "app_title":          "📚 Intellect Engine — Syllabus-Aligned Tutor",
+        "curriculum_header":  "🎓 Your Learning Profile",
+        "learning_mode":      "Learning path",
+        "school_mode":        "School (Class 1–12)",
+        "competitive_mode":   "Competitive Exams",
+        "board_label":        "Board",
+        "class_label":        "Class",
+        "stream_label":       "Stream (Class 11–12)",
+        "exam_label":         "Competitive exam",
+        "subject_label":      "Subject (optional)",
+        "subject_any":        "— General / All subjects —",
+        "active_profile":     "Active profile",
+        "guardrails_note":    "Answers are locked to your profile and textbook vault. AI will not invent citations.",
+        "chapter_header":     "📖 NCERT Chapter",
+        "chapter_label":      "Select chapter",
+        "chapter_hint":       "Answers stay within this NCERT chapter when selected.",
+        "chapter_na":         "Select a subject to see NCERT chapters.",
+        "hindi_mode_header":  "🇮🇳 Hindi-only answers",
+        "hindi_mode_help":    "Listed subjects always get full Hindi answers (Devanagari), regardless of UI language.",
+        "hindi_subjects_label": "Hindi-only for subjects",
+        "tab_chat":           "💬 Tutor Chat",
+        "tab_dashboard":      "📊 Parent / Teacher Dashboard",
+        "dashboard_title":    "📊 Learning Analytics",
+        "dashboard_subtitle": "Activity for {email}",
+        "dashboard_empty":    "No queries logged yet. Start chatting to see analytics.",
+        "metric_total":       "Total queries",
+        "metric_week":        "This week",
+        "metric_today":       "Today",
+        "metric_engines":     "AI engines used",
+        "chart_engines":      "Queries by AI engine",
+        "chart_subjects":     "Top subjects",
+        "chart_activity":     "Daily activity (last sessions)",
+        "no_activity_data":   "No dated activity yet.",
+        "recent_queries":     "Recent questions",
+        "col_time":           "Time",
+        "col_subject":        "Subject / Profile",
+        "col_engine":         "Engine",
+        "col_question":       "Question",
+        "insights_expander":  "💡 Insights for parents & teachers",
+        "insight_top_subject": "Most studied: **{subject}** ({count} queries)",
+        "insight_top_engine":  "Preferred engine: **{engine}** ({count} responses)",
+        "insight_inactive_week": "No queries this week — encourage daily practice.",
+        "vault_searching":    "Searching your question bank (semantic match)…",
         "session":            "Secure Session",
         "logout":             "Logout",
         "diagram_expander":   "📊 View AI Routing Architecture (Mermaid)",
@@ -97,7 +171,49 @@ LANG = {
         "reset_email_label":  "अपना पंजीकृत ईमेल दर्ज करें:",
         "send_reset":         "रीसेट लिंक भेजें",
         "back_to_login":      "← लॉगिन पर वापस जाएं",
-        "app_title":          "🧠 बुद्धि इंजन (मल्टी-नोड RAG)",
+        "app_title":          "📚 बुद्धि इंजन — पाठ्यक्रम-संरेखित ट्यूटर",
+        "curriculum_header":  "🎓 आपकी शिक्षा प्रोफ़ाइल",
+        "learning_mode":      "शिक्षा मार्ग",
+        "school_mode":        "स्कूल (कक्षा 1–12)",
+        "competitive_mode":   "प्रतियोगी परीक्षाएं",
+        "board_label":        "बोर्ड",
+        "class_label":        "कक्षा",
+        "stream_label":       "स्ट्रीम (कक्षा 11–12)",
+        "exam_label":         "प्रतियोगी परीक्षा",
+        "subject_label":      "विषय (वैकल्पिक)",
+        "subject_any":        "— सामान्य / सभी विषय —",
+        "active_profile":     "सक्रिय प्रोफ़ाइल",
+        "guardrails_note":    "उत्तर आपकी प्रोफ़ाइल और पाठ्य पुस्तक वॉल्ट से बंधे हैं। AI गढ़ी उद्धरण नहीं देगा।",
+        "chapter_header":     "📖 NCERT अध्याय",
+        "chapter_label":      "अध्याय चुनें",
+        "chapter_hint":       "चयनित अध्याय के भीतर उत्तर दिए जाएंगे।",
+        "chapter_na":         "अध्याय देखने के लिए विषय चुनें।",
+        "hindi_mode_header":  "🇮🇳 केवल हिंदी उत्तर",
+        "hindi_mode_help":    "चुने विषयों के उत्तर हमेशा देवनागरी हिंदी में।",
+        "hindi_subjects_label": "हिंदी-केवल विषय",
+        "tab_chat":           "💬 ट्यूटर चैट",
+        "tab_dashboard":      "📊 अभिभावक / शिक्षक डैशबोर्ड",
+        "dashboard_title":    "📊 सीखने का विश्लेषण",
+        "dashboard_subtitle": "{email} की गतिविधि",
+        "dashboard_empty":    "अभी कोई प्रश्न लॉग नहीं। चैट शुरू करें।",
+        "metric_total":       "कुल प्रश्न",
+        "metric_week":        "इस सप्ताह",
+        "metric_today":       "आज",
+        "metric_engines":     "AI इंजन",
+        "chart_engines":      "AI इंजन के अनुसार",
+        "chart_subjects":     "शीर्ष विषय",
+        "chart_activity":     "दैनिक गतिविधि",
+        "no_activity_data":   "कोई दिनांकित गतिविधि नहीं।",
+        "recent_queries":     "हाल के प्रश्न",
+        "col_time":           "समय",
+        "col_subject":        "विषय / प्रोफ़ाइल",
+        "col_engine":         "इंजन",
+        "col_question":       "प्रश्न",
+        "insights_expander":  "💡 अभिभावक / शिक्षक के लिए सुझाव",
+        "insight_top_subject": "सबसे अधिक: **{subject}** ({count} प्रश्न)",
+        "insight_top_engine":  "प्रमुख इंजन: **{engine}** ({count} उत्तर)",
+        "insight_inactive_week": "इस सप्ताह कोई प्रश्न नहीं — रोज़ अभ्यास करें।",
+        "vault_searching":    "आपके प्रश्न बैंक में खोज (अर्थ-आधारित)…",
         "session":            "सुरक्षित सत्र",
         "logout":             "लॉगआउट",
         "diagram_expander":   "📊 AI रूटिंग आर्किटेक्चर देखें (Mermaid)",
@@ -131,19 +247,47 @@ def t(key: str, **kwargs) -> str:
     text = LANG[lang].get(key, LANG["en"].get(key, key))
     return text.format(**kwargs) if kwargs else text
 
+def get_secret(name: str) -> str:
+    value = os.environ.get(name)
+    if value:
+        return value
+    try:
+        return st.secrets[name]
+    except Exception:
+        return ""
+
 # -----------------------------------------------------------------------------
 # 3. INFRASTRUCTURE & CREDENTIALS
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def init_clients():
     supabase_url = "https://pyeddkjbcfzfcajcqhnj.supabase.co"
-    supabase = create_client(supabase_url, st.secrets["SUPABASE_KEY"])
-    gemini   = genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
-    oai      = openai.OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-    claude   = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+    supabase_key = get_secret("SUPABASE_KEY")
+    gemini_key = get_secret("GEMINI_API_KEY")
+    openai_key = get_secret("OPENAI_API_KEY")
+    anthropic_key = get_secret("ANTHROPIC_API_KEY")
+    missing = [
+        name for name, value in {
+            "SUPABASE_KEY": supabase_key,
+            "GEMINI_API_KEY": gemini_key,
+            "OPENAI_API_KEY": openai_key,
+            "ANTHROPIC_API_KEY": anthropic_key,
+        }.items()
+        if not value
+    ]
+    if missing:
+        st.error(f"Missing required secret(s): {', '.join(missing)}")
+        st.stop()
+    supabase = create_client(supabase_url, supabase_key)
+    gemini   = genai.Client(api_key=gemini_key)
+    oai      = openai.OpenAI(api_key=openai_key)
+    claude   = anthropic.Anthropic(api_key=anthropic_key)
     return supabase, gemini, oai, claude
 
 supabase_client, gemini_client, openai_client, anthropic_client = init_clients()
+
+# Ensure local vault exists for fuzzy fallback (Streamlit Cloud unpacks zip)
+verify_and_unpack_database()
 
 # -----------------------------------------------------------------------------
 # 4. AUTH HELPERS
@@ -181,38 +325,76 @@ def check_cache(prompt: str) -> str | None:
         logger.warning("Cache check failed: %s", e)
     return None
 
-def fetch_rag_context(prompt: str) -> str:
-    clean_prompt = prompt.strip()
+def embed_text(text: str) -> list[float] | None:
     try:
         embed_res = gemini_client.models.embed_content(
-            model='text-embedding-004',
-            contents=clean_prompt
+            model=EMBED_MODEL,
+            contents=text,
+            config={"output_dimensionality": 768},
         )
-        query_vector = embed_res.embeddings[0].values
-        
+        if not getattr(embed_res, "embeddings", None):
+            return None
+        values = getattr(embed_res.embeddings[0], "values", None)
+        return values or None
+    except Exception as e:
+        logger.warning("Embedding failed: %s", e)
+        return None
+
+def fetch_rag_context(prompt: str, profile: dict) -> str:
+    rag_query = build_rag_query(prompt, profile)
+    try:
+        query_vector = embed_text(rag_query)
+        if not query_vector:
+            return ""
+
         docs = supabase_client.rpc("match_documents", {
             "query_embedding": query_vector,
-            "match_threshold": 0.7, 
-            "match_count": 3
+            "match_threshold": 0.65,
+            "match_count": 8,
         }).execute()
-        
+
         if docs.data:
-            return "\n\n".join([doc["content"] for doc in docs.data])
+            ranked = filter_rag_docs(docs.data, profile)[:5]
+            return "\n\n---\n\n".join(doc["content"] for doc in ranked)
     except Exception as e:
         logger.warning("RAG Retrieval failed: %s", e)
     return ""
 
-def log_to_database(user_id: str, prompt: str, response: str, engine: str):
+
+def log_to_database(
+    user_id: str,
+    prompt: str,
+    response: str,
+    engine: str,
+    profile: dict,
+):
+    base = {
+        "user_id":     user_id,
+        "prompt":      prompt.strip(),
+        "ai_response": response,
+        "engine_used": engine,
+    }
+    extended = {
+        **base,
+        "learning_mode": st.session_state.get("learning_mode"),
+        "board":         profile.get("rag_board"),
+        "level":         profile.get("rag_level"),
+        "subject":       profile.get("rag_subject"),
+        "exam":          profile.get("exam"),
+        "class_num":     profile.get("class_num"),
+        "stream":        profile.get("stream"),
+        "profile_label": profile.get("display_label"),
+        "ncert_chapter":   profile.get("ncert_chapter"),
+        "hindi_only":      profile.get("hindi_only"),
+    }
     try:
-        supabase_client.table("ai_logs").insert({
-            "user_id":     user_id,
-            "prompt":      prompt.strip(),
-            "ai_response": response,
-            "engine_used": engine,
-        }).execute()
-    except Exception as exc:
-        logger.warning("DB log failed: %s", exc)
-        st.warning(t("db_warn", e=exc))
+        supabase_client.table("ai_logs").insert(extended).execute()
+    except Exception:
+        try:
+            supabase_client.table("ai_logs").insert(base).execute()
+        except Exception as exc:
+            logger.warning("DB log failed: %s", exc)
+            st.warning(t("db_warn", e=exc))
 
 def fetch_history(user_id: str, limit: int = 20) -> list[dict]:
     try:
@@ -307,26 +489,36 @@ def build_anthropic_messages(history, user_prompt, file_content, file_mime):
     return messages
 
 # -----------------------------------------------------------------------------
-# 9. TRIPLE-THREAT AI ROUTER (With RAG + Diagram Instructions)
+# 9. RENDER HELPERS
 # -----------------------------------------------------------------------------
-def stream_intelligence(user_prompt, file_content, file_mime, history, output_placeholder):
+def render_mermaid_blocks(text: str):
+    """Render markdown body and inline Mermaid diagrams."""
+    pattern = r"```mermaid\s*\n(.*?)```"
+    parts = re.split(pattern, text, flags=re.DOTALL | re.IGNORECASE)
+    for i, part in enumerate(parts):
+        if i % 2 == 0:
+            if part.strip():
+                st.markdown(part)
+        elif stmd is not None:
+            try:
+                stmd.st_mermaid(part.strip())
+            except Exception:
+                st.code(part.strip(), language="mermaid")
+        else:
+            st.code(part.strip(), language="mermaid")
+
+
+# -----------------------------------------------------------------------------
+# 10. TRIPLE-THREAT AI ROUTER (RAG + syllabus guardrails)
+# -----------------------------------------------------------------------------
+def stream_intelligence(user_prompt, file_content, file_mime, history, output_placeholder, profile):
     trimmed_history, was_trimmed = safe_history(history)
     if was_trimmed:
         st.caption(t("context_trimmed"))
 
-    rag_context = fetch_rag_context(user_prompt)
-    
-    system_instruction = f"""
-    You are an expert engineering tutor. Answer the user's question clearly. 
-    Use the following contextual documents to inform your answer if they are relevant:
-    
-    CONTEXT:
-    {rag_context}
-    
-    CRITICAL INSTRUCTIONS:
-    1. Always include at least one concrete example.
-    2. If explaining a complex, structural, or visual concept, you MUST use Markdown tables or ASCII art to create a simple text-based diagram for the user.
-    """
+    rag_context = fetch_rag_context(user_prompt, profile)
+    effective_lang = "hi" if profile.get("hindi_only") else st.session_state.get("lang", "en")
+    system_instruction = build_system_instruction(profile, rag_context, effective_lang)
 
     full_prompt_text = user_prompt
     if file_content and file_mime == "text":
@@ -354,8 +546,9 @@ def stream_intelligence(user_prompt, file_content, file_mime, history, output_pl
                 model="gemini-2.5-flash",
                 contents=contents,
                 config=genai_types.GenerateContentConfig(
-                    temperature=0.0,
-                    system_instruction=system_instruction
+                    temperature=0.1,
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                    system_instruction=system_instruction,
                 ),
             ):
                 if chunk.text:
@@ -380,8 +573,8 @@ def stream_intelligence(user_prompt, file_content, file_mime, history, output_pl
         full_text = ""
         with anthropic_client.messages.stream(
             model="claude-haiku-4-5-20251001",
-            max_tokens=1000,
-            temperature=0.0,
+            max_tokens=MAX_OUTPUT_TOKENS,
+            temperature=0.1,
             system=system_instruction,
             messages=claude_messages,
         ) as stream:
@@ -401,7 +594,8 @@ def stream_intelligence(user_prompt, file_content, file_mime, history, output_pl
         for chunk in openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=oai_messages,
-            temperature=0.0,
+            temperature=0.1,
+            max_tokens=MAX_OUTPUT_TOKENS,
             stream=True,
         ):
             delta = chunk.choices[0].delta.content or ""
@@ -416,7 +610,144 @@ def stream_intelligence(user_prompt, file_content, file_mime, history, output_pl
     raise RuntimeError(t("all_failed"))
 
 # -----------------------------------------------------------------------------
-# 10. LANGUAGE SELECTOR (Sidebar)
+# 11. CURRICULUM PROFILE (Sidebar)
+# -----------------------------------------------------------------------------
+def init_curriculum_defaults():
+    st.session_state.setdefault("learning_mode", LEARNING_MODES[0])
+    st.session_state.setdefault("school_board", SCHOOL_BOARDS[0])
+    st.session_state.setdefault("school_class", "10")
+    st.session_state.setdefault("school_stream", STREAMS_11_12[0])
+    st.session_state.setdefault("competitive_exam", list(COMPETITIVE_EXAMS.keys())[0])
+    st.session_state.setdefault("subject_choice", t("subject_any"))
+    st.session_state.setdefault("ncert_chapter", CHAPTER_ANY)
+    st.session_state.setdefault(
+        "hindi_only_subjects",
+        [s for s in DEFAULT_HINDI_ONLY_SUBJECTS],
+    )
+
+
+def _resolve_subject() -> str:
+    subject = st.session_state.subject_choice
+    return "" if subject == t("subject_any") else subject
+
+
+def _resolve_chapter(subject: str) -> str | None:
+    ch = st.session_state.get("ncert_chapter", CHAPTER_ANY)
+    if not subject or ch == CHAPTER_ANY:
+        return None
+    return ch
+
+
+def _is_hindi_only(subject: str) -> bool:
+    if not subject:
+        return False
+    hindi_list = st.session_state.get("hindi_only_subjects", [])
+    return any(
+        subject.lower() == h.lower() or h.lower() in subject.lower()
+        for h in hindi_list
+    )
+
+
+def get_student_profile() -> dict:
+    init_curriculum_defaults()
+    subject = _resolve_subject()
+    chapter = _resolve_chapter(subject)
+    hindi_only = _is_hindi_only(subject)
+    lang = st.session_state.get("lang", "en")
+
+    if st.session_state.learning_mode == LEARNING_MODES[1]:
+        return pedagogy_profile(
+            learning_mode="Competitive Exams",
+            board="",
+            class_num=None,
+            stream=None,
+            exam=st.session_state.competitive_exam,
+            subject=subject,
+            lang=lang,
+            ncert_chapter=chapter,
+            hindi_only=hindi_only,
+        )
+
+    stream = None
+    if int(st.session_state.school_class) >= 11:
+        stream = st.session_state.school_stream
+
+    return pedagogy_profile(
+        learning_mode="School (Class 1–12)",
+        board=st.session_state.school_board,
+        class_num=st.session_state.school_class,
+        stream=stream,
+        exam=None,
+        subject=subject,
+        lang=lang,
+        ncert_chapter=chapter,
+        hindi_only=hindi_only,
+    )
+
+
+def render_curriculum_sidebar():
+    init_curriculum_defaults()
+    st.subheader(t("curriculum_header"))
+
+    mode = st.radio(
+        t("learning_mode"),
+        LEARNING_MODES,
+        index=LEARNING_MODES.index(st.session_state.learning_mode),
+        key="learning_mode_radio",
+    )
+    st.session_state.learning_mode = mode
+
+    if mode == LEARNING_MODES[0]:
+        st.selectbox(t("board_label"), SCHOOL_BOARDS, key="school_board")
+        st.selectbox(t("class_label"), SCHOOL_CLASSES, key="school_class")
+        if int(st.session_state.school_class) >= 11:
+            st.selectbox(t("stream_label"), STREAMS_11_12, key="school_stream")
+        subjects = [t("subject_any")] + subjects_for_school(st.session_state.school_class)
+        st.selectbox(t("subject_label"), subjects, key="subject_choice")
+
+        subject = _resolve_subject()
+        st.markdown(f"**{t('chapter_header')}**")
+        if subject and chapter_available(st.session_state.school_class, subject):
+            chapters = ncert_chapters_for(st.session_state.school_class, subject)
+            st.selectbox(t("chapter_label"), chapters, key="ncert_chapter")
+            st.caption(t("chapter_hint"))
+        else:
+            st.caption(t("chapter_na") if not subject else t("chapter_hint"))
+    else:
+        st.selectbox(
+            t("exam_label"),
+            list(COMPETITIVE_EXAMS.keys()),
+            key="competitive_exam",
+        )
+        exam_meta = COMPETITIVE_EXAMS[st.session_state.competitive_exam]
+        subjects = [t("subject_any")] + exam_meta["subjects"]
+        st.selectbox(t("subject_label"), subjects, key="subject_choice")
+
+    st.divider()
+    st.markdown(f"**{t('hindi_mode_header')}**")
+    st.caption(t("hindi_mode_help"))
+    all_subjects = sorted(set(
+        subjects_for_school(st.session_state.get("school_class", "10"))
+        + [s for ex in COMPETITIVE_EXAMS.values() for s in ex["subjects"]]
+        + DEFAULT_HINDI_ONLY_SUBJECTS
+    ))
+    st.multiselect(
+        t("hindi_subjects_label"),
+        options=all_subjects,
+        default=st.session_state.hindi_only_subjects,
+        key="hindi_only_subjects",
+    )
+
+    profile = get_student_profile()
+    if profile.get("hindi_only"):
+        st.success("🇮🇳 Hindi-only mode active for this subject")
+    st.info(f"**{t('active_profile')}:** {profile['display_label']}")
+    st.caption(t("guardrails_note"))
+    return profile
+
+
+# -----------------------------------------------------------------------------
+# 12. LANGUAGE SELECTOR (Sidebar)
 # -----------------------------------------------------------------------------
 with st.sidebar:
     lang_choice = st.radio(
@@ -431,7 +762,7 @@ with st.sidebar:
         st.rerun()
 
 # -----------------------------------------------------------------------------
-# 11. AUTH UI 
+# 13. AUTH UI 
 # -----------------------------------------------------------------------------
 def auth_ui():
     if "auth_view" not in st.session_state:
@@ -518,9 +849,11 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
 # -----------------------------------------------------------------------------
-# 12. SIDEBAR HISTORY & SETTINGS
+# 14. SIDEBAR HISTORY & SETTINGS
 # -----------------------------------------------------------------------------
 with st.sidebar:
+    st.divider()
+    active_profile = render_curriculum_sidebar()
     st.divider()
     st.subheader(t("sidebar_settings"))
     st.caption(f"{t('session')}: {st.session_state.user.email}")
@@ -577,117 +910,162 @@ with st.sidebar:
         st.caption(t("no_history"))
 
 # -----------------------------------------------------------------------------
-# 13. MAIN APP EXECUTION
+# 15. MAIN APP EXECUTION
 # -----------------------------------------------------------------------------
-st.title(t("app_title"))
+tab_chat, tab_dashboard = st.tabs([t("tab_chat"), t("tab_dashboard")])
 
-with st.expander(t("diagram_expander"), expanded=False):
-    st.markdown("""
+with tab_dashboard:
+    render_dashboard(
+        supabase_client,
+        st.session_state.user.id,
+        st.session_state.user.email,
+        t,
+    )
+
+with tab_chat:
+    st.title(t("app_title"))
+    profile_banner = get_student_profile()
+    st.caption(f"🎯 {profile_banner['display_label']}")
+    if profile_banner.get("hindi_only"):
+        st.caption("🇮🇳 " + t("hindi_mode_header"))
+
+    with st.expander(t("diagram_expander"), expanded=False):
+        st.markdown("""
 ```mermaid
 flowchart TD
-    A([👤 User Query]) --> B{🗄️ Check DB Cache}
-    B -->|Found Match| C([⚡ Instant Free Response])
-    B -->|No Match| D[🔍 RAG Vector Search]
-    D --> E[🚦 Triple-Threat AI Router]
-    E --> F[Gemini 2.5 Flash]
-    F -->|Fails| G[Claude Haiku 4.5]
-    G -->|Fails| H[GPT-4o-mini]
-    F -->|Success| I([✅ Response to User])
-    G -->|Success| I
-    H -->|Success| I
-    I --> J[(💾 Save to Supabase Cache)]
-    
+    A([👤 Student Query + Profile]) --> B{🗄️ Exact Cache?}
+    B -->|Hit| C([⚡ Cached Answer])
+    B -->|Miss| V{📚 Semantic Vault Q→A?}
+    V -->|Strong match| W([✅ Answer from your database])
+    V -->|No match| D[🔍 RAG + AI APIs]
+    D --> E[📋 Syllabus Guardrails Prompt]
+    E --> F[🚦 AI Router]
+    F --> G[Gemini 2.5 Flash]
+    G -->|Fail| H[Claude Haiku]
+    H -->|Fail| I[GPT-4o-mini]
+    G --> J([✅ Level-Matched Answer + Mermaid])
+    H --> J
+    I --> J
+    J --> K[(💾 Supabase ai_logs)]
+
     style A fill:#4A90D9,color:#fff
-    style B fill:#0F9D58,color:#fff
-    style C fill:#0F9D58,color:#fff
     style D fill:#7B68EE,color:#fff
-    style E fill:#7B68EE,color:#fff
-    style I fill:#4A90D9,color:#fff
-    style J fill:#0F9D58,color:#fff
+    style E fill:#E67E22,color:#fff
+    style J fill:#4A90D9,color:#fff
+    style K fill:#0F9D58,color:#fff
                 """)
-st.divider()
+    st.divider()
 
-for turn in st.session_state.chat_history:
-    with st.chat_message("user"):
-        st.markdown(turn["user"])
-        if turn.get("file_name"):
-            st.caption(t("file_note", name=turn["file_name"]))
-    with st.chat_message("assistant"):
-        st.markdown(turn["assistant"])
-        st.caption(f"— {turn['provider']}")
-
-uploaded_file = st.file_uploader(
-    t("upload_label"),
-    type=["txt", "csv", "json", "pdf", "png", "jpg", "jpeg", "webp"],
-    label_visibility="visible",
-)
-
-query = st.chat_input(t("query_label"))
-
-if query:
-    clean_query = f"[{uploaded_file.name}] {query}" if uploaded_file else query
-    
-    with st.chat_message("user"):
-        st.markdown(query)
-        if uploaded_file:
-            st.caption(t("file_note", name=uploaded_file.name))
-
-    # PHASE 1: CACHE
-    cached_answer = check_cache(clean_query)
-    if cached_answer:
+    for turn in st.session_state.chat_history:
+        with st.chat_message("user"):
+            st.markdown(turn["user"])
+            if turn.get("file_name"):
+                st.caption(t("file_note", name=turn["file_name"]))
         with st.chat_message("assistant"):
-            st.markdown(cached_answer)
-            st.caption("— ⚡ Loaded from Cache (Free)")
-            
-        st.session_state.chat_history.append({
-            "user":      query,
-            "assistant": cached_answer,
-            "provider":  "Cache Hit",
-            "file_name": uploaded_file.name if uploaded_file else None,
-        })
-        st.stop()
+            render_mermaid_blocks(turn["assistant"])
+            st.caption(f"— {turn['provider']}")
 
-    # PHASE 2 & 3: RAG + GENERATION
-    file_content, file_mime, file_error = None, None, None
-    file_name = None
-    if uploaded_file:
-        file_content, file_mime, file_error = extract_file_content(uploaded_file)
-        if file_error:
-            st.error(file_error)
-            st.stop()
-        file_name = uploaded_file.name
+    uploaded_file = st.file_uploader(
+        t("upload_label"),
+        type=["txt", "csv", "json", "pdf", "png", "jpg", "jpeg", "webp"],
+        label_visibility="visible",
+    )
 
-    with st.chat_message("assistant"):
-        placeholder = st.empty()
-        try:
-            answer, provider = stream_intelligence(
-                user_prompt=query,
-                file_content=file_content,
-                file_mime=file_mime,
-                history=st.session_state.chat_history,
-                output_placeholder=placeholder,
-            )
-            st.caption(f"— {provider}")
+    query = st.chat_input(t("query_label"))
+
+    if query:
+        profile = get_student_profile()
+        base_query = f"[{uploaded_file.name}] {query}" if uploaded_file else query
+        clean_query = cache_key(base_query, profile)
+
+        with st.chat_message("user"):
+            st.markdown(query)
+            if uploaded_file:
+                st.caption(t("file_note", name=uploaded_file.name))
+
+        cached_answer = check_cache(clean_query)
+        if cached_answer:
+            with st.chat_message("assistant"):
+                render_mermaid_blocks(cached_answer)
+                st.caption("— ⚡ Loaded from Cache (Free)")
 
             st.session_state.chat_history.append({
                 "user":      query,
-                "assistant": answer,
-                "provider":  provider,
-                "file_name": file_name,
+                "assistant": cached_answer,
+                "provider":  "Cache Hit",
+                "file_name": uploaded_file.name if uploaded_file else None,
             })
+            st.stop()
 
-            # PHASE 4: SAVE CACHE
-            log_to_database(
-                user_id=st.session_state.user.id,
-                prompt=clean_query,
-                response=answer,
-                engine=provider,
-            )
+        # PHASE 2: Semantic Q→A from vault (rephrased questions OK; skips API if strong match)
+        if not uploaded_file:
+            with st.spinner(t("vault_searching")):
+                vault_hit = lookup_vault_answer(
+                    query, profile, supabase_client, gemini_client
+                )
+            if vault_hit:
+                with st.chat_message("assistant"):
+                    render_mermaid_blocks(vault_hit.answer)
+                    st.caption(f"— {vault_hit.provider_label}")
 
-        except RuntimeError as err:
-            st.error(str(err))
+                st.session_state.chat_history.append({
+                    "user":      query,
+                    "assistant": vault_hit.answer,
+                    "provider":  vault_hit.provider_label,
+                    "file_name": None,
+                })
+                log_to_database(
+                    user_id=st.session_state.user.id,
+                    prompt=clean_query,
+                    response=vault_hit.answer,
+                    engine=vault_hit.provider_label,
+                    profile=profile,
+                )
+                st.stop()
 
-if st.session_state.chat_history:
-    if st.button(t("clear_chat"), type="secondary"):
-        st.session_state.chat_history = []
-        st.rerun()
+        file_content, file_mime, file_error = None, None, None
+        file_name = None
+        if uploaded_file:
+            file_content, file_mime, file_error = extract_file_content(uploaded_file)
+            if file_error:
+                st.error(file_error)
+                st.stop()
+            file_name = uploaded_file.name
+
+        with st.chat_message("assistant"):
+            placeholder = st.empty()
+            try:
+                answer, provider = stream_intelligence(
+                    user_prompt=query,
+                    file_content=file_content,
+                    file_mime=file_mime,
+                    history=st.session_state.chat_history,
+                    output_placeholder=placeholder,
+                    profile=profile,
+                )
+                placeholder.empty()
+                render_mermaid_blocks(answer)
+                st.caption(f"— {provider}")
+
+                st.session_state.chat_history.append({
+                    "user":      query,
+                    "assistant": answer,
+                    "provider":  provider,
+                    "file_name": file_name,
+                })
+
+                log_to_database(
+                    user_id=st.session_state.user.id,
+                    prompt=clean_query,
+                    response=answer,
+                    engine=provider,
+                    profile=profile,
+                )
+
+            except RuntimeError as err:
+                st.error(str(err))
+
+    if st.session_state.chat_history:
+        if st.button(t("clear_chat"), type="secondary"):
+            st.session_state.chat_history = []
+            st.rerun()
