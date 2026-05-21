@@ -975,7 +975,12 @@ def get_student_profile() -> dict:
     )
 
 
-def render_curriculum_sidebar():
+def _sync_widget_value(widget_key: str, state_key: str):
+    if widget_key in st.session_state:
+        st.session_state[state_key] = st.session_state[widget_key]
+
+
+def render_curriculum_controls(key_prefix: str = "sidebar", show_summary: bool = True):
     init_curriculum_defaults()
     st.subheader(t("curriculum_header"))
 
@@ -983,7 +988,7 @@ def render_curriculum_sidebar():
         t("learning_mode"),
         LEARNING_MODES,
         default=st.session_state.learning_mode,
-        key="learning_mode_radio",
+        key=f"{key_prefix}_learning_mode",
     )
     st.session_state.learning_mode = mode or st.session_state.learning_mode
 
@@ -997,18 +1002,57 @@ def render_curriculum_sidebar():
             """,
             unsafe_allow_html=True,
         )
-        st.selectbox(t("board_label"), SCHOOL_BOARDS, key="school_board")
-        st.selectbox(t("class_label"), SCHOOL_CLASSES, key="school_class")
+        st.selectbox(
+            t("board_label"),
+            SCHOOL_BOARDS,
+            index=SCHOOL_BOARDS.index(st.session_state.school_board),
+            key=f"{key_prefix}_school_board",
+            on_change=_sync_widget_value,
+            args=(f"{key_prefix}_school_board", "school_board"),
+        )
+        st.selectbox(
+            t("class_label"),
+            SCHOOL_CLASSES,
+            index=SCHOOL_CLASSES.index(st.session_state.school_class),
+            key=f"{key_prefix}_school_class",
+            on_change=_sync_widget_value,
+            args=(f"{key_prefix}_school_class", "school_class"),
+        )
         if int(st.session_state.school_class) >= 11:
-            st.selectbox(t("stream_label"), STREAMS_11_12, key="school_stream")
+            st.selectbox(
+                t("stream_label"),
+                STREAMS_11_12,
+                index=STREAMS_11_12.index(st.session_state.school_stream),
+                key=f"{key_prefix}_school_stream",
+                on_change=_sync_widget_value,
+                args=(f"{key_prefix}_school_stream", "school_stream"),
+            )
         subjects = [t("subject_any")] + subjects_for_school(st.session_state.school_class)
-        st.selectbox(t("subject_label"), subjects, key="subject_choice")
+        if st.session_state.subject_choice not in subjects:
+            st.session_state.subject_choice = t("subject_any")
+        st.selectbox(
+            t("subject_label"),
+            subjects,
+            index=subjects.index(st.session_state.subject_choice),
+            key=f"{key_prefix}_subject_choice",
+            on_change=_sync_widget_value,
+            args=(f"{key_prefix}_subject_choice", "subject_choice"),
+        )
 
         subject = _resolve_subject()
         st.markdown(f"**{t('chapter_header')}**")
         if subject and chapter_available(st.session_state.school_class, subject):
             chapters = ncert_chapters_for(st.session_state.school_class, subject)
-            st.selectbox(t("chapter_label"), chapters, key="ncert_chapter")
+            if st.session_state.ncert_chapter not in chapters:
+                st.session_state.ncert_chapter = CHAPTER_ANY
+            st.selectbox(
+                t("chapter_label"),
+                chapters,
+                index=chapters.index(st.session_state.ncert_chapter),
+                key=f"{key_prefix}_ncert_chapter",
+                on_change=_sync_widget_value,
+                args=(f"{key_prefix}_ncert_chapter", "ncert_chapter"),
+            )
             st.caption(t("chapter_hint"))
         else:
             st.caption(t("chapter_na") if not subject else t("chapter_hint"))
@@ -1025,11 +1069,23 @@ def render_curriculum_sidebar():
         st.selectbox(
             t("exam_label"),
             list(COMPETITIVE_EXAMS.keys()),
-            key="competitive_exam",
+            index=list(COMPETITIVE_EXAMS.keys()).index(st.session_state.competitive_exam),
+            key=f"{key_prefix}_competitive_exam",
+            on_change=_sync_widget_value,
+            args=(f"{key_prefix}_competitive_exam", "competitive_exam"),
         )
         exam_meta = COMPETITIVE_EXAMS[st.session_state.competitive_exam]
         subjects = [t("subject_any")] + exam_meta["subjects"]
-        st.selectbox(t("subject_label"), subjects, key="subject_choice")
+        if st.session_state.subject_choice not in subjects:
+            st.session_state.subject_choice = t("subject_any")
+        st.selectbox(
+            t("subject_label"),
+            subjects,
+            index=subjects.index(st.session_state.subject_choice),
+            key=f"{key_prefix}_subject_choice",
+            on_change=_sync_widget_value,
+            args=(f"{key_prefix}_subject_choice", "subject_choice"),
+        )
 
     st.divider()
     st.markdown(f"**{t('hindi_mode_header')}**")
@@ -1043,15 +1099,22 @@ def render_curriculum_sidebar():
         t("hindi_subjects_label"),
         options=all_subjects,
         default=st.session_state.hindi_only_subjects,
-        key="hindi_only_subjects",
+        key=f"{key_prefix}_hindi_only_subjects",
+        on_change=_sync_widget_value,
+        args=(f"{key_prefix}_hindi_only_subjects", "hindi_only_subjects"),
     )
 
     profile = get_student_profile()
-    if profile.get("hindi_only"):
-        st.success("🇮🇳 Hindi-only mode active for this subject")
-    st.info(f"**{t('active_profile')}:** {profile['display_label']}")
-    st.caption(t("guardrails_note"))
+    if show_summary:
+        if profile.get("hindi_only"):
+            st.success("🇮🇳 Hindi-only mode active for this subject")
+        st.info(f"**{t('active_profile')}:** {profile['display_label']}")
+        st.caption(t("guardrails_note"))
     return profile
+
+
+def render_curriculum_sidebar():
+    return render_curriculum_controls("sidebar", show_summary=True)
 
 
 # -----------------------------------------------------------------------------
@@ -1247,6 +1310,9 @@ with tab_dashboard:
 with tab_chat:
     profile_banner = get_student_profile()
     render_hero(profile_banner)
+    with st.expander("🎓 Change class, subject, or exam", expanded=False):
+        render_curriculum_controls("main", show_summary=True)
+        profile_banner = get_student_profile()
     if profile_banner.get("hindi_only"):
         st.caption("🇮🇳 " + t("hindi_mode_header"))
 
